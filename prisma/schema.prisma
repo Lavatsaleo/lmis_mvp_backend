@@ -38,6 +38,20 @@ enum BoxEventType {
   ADJUSTMENT
 }
 
+enum Sex {
+  M
+  F
+  U
+}
+
+enum ChildStatus {
+  ACTIVE
+  CURED
+  DEFAULTED
+  DIED
+  TRANSFERRED_OUT
+}
+
 model Facility {
   id   String       @id @default(cuid())
   code String       @unique
@@ -46,6 +60,11 @@ model Facility {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // link a Facility to a Warehouse (warehouses are also Facility records)
+  warehouseId String?
+  warehouse   Facility?  @relation("WarehouseFacilities", fields: [warehouseId], references: [id])
+  facilities  Facility[] @relation("WarehouseFacilities") // child facilities under this warehouse
 
   // Users assigned to this facility
   users User[]
@@ -58,6 +77,12 @@ model Facility {
 
   // Facility-level history: events where this facility is the destination
   inboundEvents BoxEvent[] @relation("toFacility")
+
+  // Clinical children registered at this facility
+  children  Child[]
+  dispenses Dispense[]
+
+  @@index([warehouseId])
 }
 
 model User {
@@ -73,6 +98,9 @@ model User {
 
   // BoxEvent.performedBy relation
   events BoxEvent[]
+
+  // Dispense.performedBy relation
+  dispenses Dispense[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -95,7 +123,8 @@ model Product {
   code String @unique
   name String
 
-  boxes Box[]
+  boxes     Box[]
+  dispenses Dispense[]
 }
 
 model Box {
@@ -108,12 +137,19 @@ model Box {
   status     BoxStatus @default(CREATED)
   createdAt  DateTime  @default(now())
 
+  // sachet tracking (for last-mile dashboards)
+  unitsTotal     Int @default(0) // e.g. sachets per box
+  unitsRemaining Int @default(0)
+
   currentFacilityId String?
   currentFacility   Facility? @relation("currentFacility", fields: [currentFacilityId], references: [id])
 
   order   Order      @relation(fields: [orderId], references: [id])
   product Product    @relation(fields: [productId], references: [id])
   events  BoxEvent[]
+
+  // clinical linkage
+  dispenses Dispense[]
 
   @@index([orderId])
   @@index([productId])
@@ -143,4 +179,60 @@ model BoxEvent {
   @@index([fromFacilityId])
   @@index([toFacilityId])
   @@index([type])
+}
+
+model Child {
+  id         String   @id @default(cuid())
+  facilityId String
+  facility   Facility @relation(fields: [facilityId], references: [id])
+
+  // Facility-level child identifier (clinic number / card number)
+  childCode String
+
+  fullName       String?
+  sex            Sex?        @default(U)
+  dob            DateTime?
+  caregiverPhone String?
+  status         ChildStatus @default(ACTIVE)
+
+  // Duplicates handling (MVP): compute in API (hash of key fields)
+  dedupeKey String?
+
+  dispenses Dispense[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([facilityId, childCode])
+  @@unique([facilityId, dedupeKey])
+  @@index([facilityId])
+}
+
+model Dispense {
+  id String @id @default(cuid())
+
+  childId String
+  child   Child  @relation(fields: [childId], references: [id])
+
+  facilityId String
+  facility   Facility @relation(fields: [facilityId], references: [id])
+
+  boxId String?
+  box   Box?    @relation(fields: [boxId], references: [id])
+
+  productId String?
+  product   Product? @relation(fields: [productId], references: [id])
+
+  performedByUserId String
+  performedBy       User   @relation(fields: [performedByUserId], references: [id])
+
+  unitsDispensed Int
+  note           String?
+  dispensedAt    DateTime @default(now())
+
+  @@index([childId])
+  @@index([facilityId])
+  @@index([boxId])
+  @@index([productId])
+  @@index([performedByUserId])
 }

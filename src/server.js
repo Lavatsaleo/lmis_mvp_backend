@@ -10,6 +10,8 @@ const userRoutes = require("./routes/users");
 const boxesRoutes = require("./routes/boxes");
 const txRoutes = require("./routes/transactions");
 const orderRoutes = require("./routes/orders");
+const facilityRoutes = require("./routes/facilities");
+
 
 const app = express();
 
@@ -27,6 +29,8 @@ app.use("/api/auth", authRoutes);
 app.use("/api/boxes", boxesRoutes);
 app.use("/api/transactions", txRoutes);
 app.use("/api/orders", orderRoutes);
+app.use("/api/facilities", facilityRoutes);
+
 
 // Keep /api (me + users) last
 app.use("/api", userRoutes);
