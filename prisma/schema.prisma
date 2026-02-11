@@ -1,0 +1,146 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  WAREHOUSE_OFFICER
+  FACILITY_OFFICER
+  CLINICIAN
+  VIEWER
+}
+
+enum FacilityType {
+  WAREHOUSE
+  FACILITY
+}
+
+enum BoxStatus {
+  CREATED
+  IN_WAREHOUSE
+  IN_TRANSIT
+  IN_FACILITY
+  DISPENSED
+  VOID
+}
+
+enum BoxEventType {
+  QR_CREATED
+  WAREHOUSE_RECEIVE
+  DISPATCH
+  FACILITY_RECEIVE
+  DISPENSE
+  ADJUSTMENT
+}
+
+model Facility {
+  id   String       @id @default(cuid())
+  code String       @unique
+  name String
+  type FacilityType @default(FACILITY)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Users assigned to this facility
+  users User[]
+
+  // Boxes currently at this facility
+  boxes Box[] @relation("currentFacility")
+
+  // Facility-level history: events where this facility is the source
+  outboundEvents BoxEvent[] @relation("fromFacility")
+
+  // Facility-level history: events where this facility is the destination
+  inboundEvents BoxEvent[] @relation("toFacility")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  fullName     String
+  passwordHash String
+  role         UserRole @default(VIEWER)
+  isActive     Boolean  @default(true)
+
+  facilityId String?
+  facility   Facility? @relation(fields: [facilityId], references: [id])
+
+  // BoxEvent.performedBy relation
+  events BoxEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([facilityId])
+  @@index([role])
+}
+
+model Order {
+  id          String   @id @default(cuid())
+  orderNumber String   @unique
+  donorName   String?
+  createdAt   DateTime @default(now())
+
+  boxes Box[]
+}
+
+model Product {
+  id   String @id @default(cuid())
+  code String @unique
+  name String
+
+  boxes Box[]
+}
+
+model Box {
+  id         String    @id @default(cuid())
+  boxUid     String    @unique
+  orderId    String
+  productId  String
+  batchNo    String
+  expiryDate DateTime
+  status     BoxStatus @default(CREATED)
+  createdAt  DateTime  @default(now())
+
+  currentFacilityId String?
+  currentFacility   Facility? @relation("currentFacility", fields: [currentFacilityId], references: [id])
+
+  order   Order      @relation(fields: [orderId], references: [id])
+  product Product    @relation(fields: [productId], references: [id])
+  events  BoxEvent[]
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([currentFacilityId])
+  @@index([batchNo])
+  @@index([expiryDate])
+}
+
+model BoxEvent {
+  id                String       @id @default(cuid())
+  boxId             String
+  type              BoxEventType
+  performedByUserId String
+  fromFacilityId    String?
+  toFacilityId      String?
+  note              String?
+  createdAt         DateTime     @default(now())
+
+  box         Box  @relation(fields: [boxId], references: [id])
+  performedBy User @relation(fields: [performedByUserId], references: [id])
+
+  fromFacility Facility? @relation("fromFacility", fields: [fromFacilityId], references: [id])
+  toFacility   Facility? @relation("toFacility", fields: [toFacilityId], references: [id])
+
+  @@index([boxId])
+  @@index([performedByUserId])
+  @@index([fromFacilityId])
+  @@index([toFacilityId])
+  @@index([type])
+}
