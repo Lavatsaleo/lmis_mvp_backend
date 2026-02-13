@@ -38,20 +38,6 @@ enum BoxEventType {
   ADJUSTMENT
 }
 
-enum Sex {
-  M
-  F
-  U
-}
-
-enum ChildStatus {
-  ACTIVE
-  CURED
-  DEFAULTED
-  DIED
-  TRANSFERRED_OUT
-}
-
 model Facility {
   id   String       @id @default(cuid())
   code String       @unique
@@ -64,7 +50,7 @@ model Facility {
   // link a Facility to a Warehouse (warehouses are also Facility records)
   warehouseId String?
   warehouse   Facility?  @relation("WarehouseFacilities", fields: [warehouseId], references: [id])
-  facilities  Facility[] @relation("WarehouseFacilities") // child facilities under this warehouse
+  facilities  Facility[] @relation("WarehouseFacilities")
 
   // Users assigned to this facility
   users User[]
@@ -78,9 +64,11 @@ model Facility {
   // Facility-level history: events where this facility is the destination
   inboundEvents BoxEvent[] @relation("toFacility")
 
-  // Clinical children registered at this facility
-  children  Child[]
-  dispenses Dispense[]
+  // Clinical
+  caregivers  Caregiver[]
+  children    Child[]
+  childVisits ChildVisit[]
+  assessments InDepthAssessment[]
 
   @@index([warehouseId])
 }
@@ -96,11 +84,12 @@ model User {
   facilityId String?
   facility   Facility? @relation(fields: [facilityId], references: [id])
 
-  // BoxEvent.performedBy relation
-  events BoxEvent[]
+  // Logistics events performed by this user
+  boxEvents BoxEvent[] @relation("PerformedBoxEvents")
 
-  // Dispense.performedBy relation
-  dispenses Dispense[]
+  // Clinical actions performed by this user
+  childVisits  ChildVisit[]       @relation("PerformedVisits")
+  assessments  InDepthAssessment[] @relation("PerformedAssessments")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -123,8 +112,7 @@ model Product {
   code String @unique
   name String
 
-  boxes     Box[]
-  dispenses Dispense[]
+  boxes Box[]
 }
 
 model Box {
@@ -137,10 +125,6 @@ model Box {
   status     BoxStatus @default(CREATED)
   createdAt  DateTime  @default(now())
 
-  // sachet tracking (for last-mile dashboards)
-  unitsTotal     Int @default(0) // e.g. sachets per box
-  unitsRemaining Int @default(0)
-
   currentFacilityId String?
   currentFacility   Facility? @relation("currentFacility", fields: [currentFacilityId], references: [id])
 
@@ -148,7 +132,7 @@ model Box {
   product Product    @relation(fields: [productId], references: [id])
   events  BoxEvent[]
 
-  // clinical linkage
+  // Optional: link a dispensation record to this box (clinical)
   dispenses Dispense[]
 
   @@index([orderId])
@@ -169,7 +153,8 @@ model BoxEvent {
   createdAt         DateTime     @default(now())
 
   box         Box  @relation(fields: [boxId], references: [id])
-  performedBy User @relation(fields: [performedByUserId], references: [id])
+
+  performedBy User @relation("PerformedBoxEvents", fields: [performedByUserId], references: [id])
 
   fromFacility Facility? @relation("fromFacility", fields: [fromFacilityId], references: [id])
   toFacility   Facility? @relation("toFacility", fields: [toFacilityId], references: [id])
@@ -181,58 +166,138 @@ model BoxEvent {
   @@index([type])
 }
 
-model Child {
+//
+// -------------------- CLINICAL --------------------
+//
+
+model Caregiver {
   id         String   @id @default(cuid())
   facilityId String
-  facility   Facility @relation(fields: [facilityId], references: [id])
-
-  // Facility-level child identifier (clinic number / card number)
-  childCode String
-
-  fullName       String?
-  sex            Sex?        @default(U)
-  dob            DateTime?
-  caregiverPhone String?
-  status         ChildStatus @default(ACTIVE)
-
-  // Duplicates handling (MVP): compute in API (hash of key fields)
-  dedupeKey String?
-
-  dispenses Dispense[]
+  fullName   String
+  contacts   String
+  village    String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([facilityId, childCode])
-  @@unique([facilityId, dedupeKey])
+  facility Facility @relation(fields: [facilityId], references: [id])
+  children Child[]
+
+  // Helps you handle duplicates well: same phone in the same facility should not create new caregiver
+  @@unique([facilityId, contacts])
   @@index([facilityId])
+  @@index([fullName])
 }
 
-model Dispense {
-  id String @id @default(cuid())
+model Child {
+  id             String   @id @default(cuid())
+  facilityId     String
+  caregiverId    String
 
-  childId String
-  child   Child  @relation(fields: [childId], references: [id])
+  // Program code (for now SQLNS, but keep as String for flexibility/MVP)
+  program        String   @default("SQLNS")
 
-  facilityId String
-  facility   Facility @relation(fields: [facilityId], references: [id])
+  enrollmentDate DateTime @default(now())
 
-  boxId String?
-  box   Box?    @relation(fields: [boxId], references: [id])
+  firstName      String
+  lastName       String
+  sex            String
+  dateOfBirth    DateTime
+  cwcNumber      String
 
-  productId String?
-  product   Product? @relation(fields: [productId], references: [id])
+  // Your “silver bullet” unique child number (facilityCode/cwc/year/program) built in API, stored here
+  uniqueChildNumber String @unique
 
+  // Optional CHP details from registration form
+  chpName      String?
+  chpContacts  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  facility  Facility  @relation(fields: [facilityId], references: [id])
+  caregiver Caregiver @relation(fields: [caregiverId], references: [id])
+
+  visits ChildVisit[]
+
+  // One in-depth assessment immediately after registration (Option 1)
+  inDepthAssessment InDepthAssessment?
+
+  @@index([facilityId])
+  @@index([caregiverId])
+  @@index([lastName, firstName])
+  @@index([cwcNumber])
+  @@index([program])
+}
+
+model InDepthAssessment {
+  id                String   @id @default(cuid())
+  childId            String   @unique
+  facilityId         String
+  performedByUserId  String
+
+  // When the assessment was done (default now, but you can set from form)
+  assessmentDate DateTime @default(now())
+
+  // Keep the whole form payload here (all answers + skip logic outputs)
+  data Json
+
+  // OPTIONAL: store a few key values for dashboards (fast queries)
+  muacMm              Int?
+  weightKg            Float?
+  heightCm            Float?
+  householdHungerScore Int?
+  householdHungerCategory String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  child       Child     @relation(fields: [childId], references: [id])
+  facility    Facility  @relation(fields: [facilityId], references: [id])
+  performedBy User      @relation("PerformedAssessments", fields: [performedByUserId], references: [id])
+
+  @@index([facilityId])
+  @@index([performedByUserId])
+  @@index([assessmentDate])
+}
+
+model ChildVisit {
+  id               String   @id @default(cuid())
+  childId           String
+  facilityId        String
   performedByUserId String
-  performedBy       User   @relation(fields: [performedByUserId], references: [id])
 
-  unitsDispensed Int
-  note           String?
-  dispensedAt    DateTime @default(now())
+  visitDate DateTime
+  notes     String?
+
+  createdAt DateTime @default(now())
+
+  child       Child     @relation(fields: [childId], references: [id])
+  facility    Facility  @relation(fields: [facilityId], references: [id])
+  performedBy User      @relation("PerformedVisits", fields: [performedByUserId], references: [id])
+
+  dispenses Dispense[]
 
   @@index([childId])
   @@index([facilityId])
-  @@index([boxId])
-  @@index([productId])
   @@index([performedByUserId])
+  @@index([visitDate])
+}
+
+model Dispense {
+  id        String   @id @default(cuid())
+  visitId   String
+  boxId     String?  // optional if dispensing without scanning a box (future)
+  quantitySachets Int
+  note      String?
+
+  createdAt DateTime @default(now())
+
+  visit ChildVisit @relation(fields: [visitId], references: [id])
+
+  // Link to box if scanned
+  box   Box? @relation(fields: [boxId], references: [id])
+
+  @@index([visitId])
+  @@index([boxId])
 }

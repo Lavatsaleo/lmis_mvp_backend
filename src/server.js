@@ -11,6 +11,7 @@ const boxesRoutes = require("./routes/boxes");
 const txRoutes = require("./routes/transactions");
 const orderRoutes = require("./routes/orders");
 const facilityRoutes = require("./routes/facilities");
+const clinicalRoutes = require("./routes/clinical");
 
 
 const app = express();
@@ -30,6 +31,7 @@ app.use("/api/boxes", boxesRoutes);
 app.use("/api/transactions", txRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/facilities", facilityRoutes);
+app.use("/api/clinical", clinicalRoutes);
 
 
 // Keep /api (me + users) last

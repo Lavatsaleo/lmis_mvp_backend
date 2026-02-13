@@ -56,11 +56,152 @@ router.post("/", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
 });
 
 /**
+ * PATCH /api/facilities/:facilityId/link-warehouse
+ * Roles: SUPER_ADMIN
+ * Body: { warehouseId } OR { warehouseCode }
+ */
+router.patch(
+  "/:facilityId/link-warehouse",
+  requireAuth,
+  requireRole("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const { facilityId } = req.params;
+      const { warehouseId, warehouseCode } = req.body || {};
+
+      if (!warehouseId && !warehouseCode) {
+        return res.status(400).json({ message: "Provide warehouseId or warehouseCode" });
+      }
+
+      const facility = await prisma.facility.findUnique({ where: { id: String(facilityId) } });
+      if (!facility) return res.status(404).json({ message: "Facility not found" });
+      if (facility.type !== "FACILITY") {
+        return res.status(400).json({ message: "Only FACILITY records can be linked to a warehouse" });
+      }
+
+      let wh = null;
+      if (warehouseId) {
+        wh = await prisma.facility.findUnique({ where: { id: String(warehouseId) } });
+      } else {
+        wh = await prisma.facility.findUnique({ where: { code: String(warehouseCode).trim() } });
+      }
+
+      if (!wh) return res.status(404).json({ message: "Warehouse not found" });
+      if (wh.type !== "WAREHOUSE") {
+        return res.status(400).json({ message: "Target must be a WAREHOUSE facility" });
+      }
+
+      const updated = await prisma.facility.update({
+        where: { id: facility.id },
+        data: { warehouseId: wh.id },
+        include: { warehouse: true },
+      });
+
+      return res.json({ message: "Linked", facility: updated });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+    }
+  }
+);
+
+/**
+ * PATCH /api/facilities/bulk/link-warehouse
+ * Roles: SUPER_ADMIN
+ * Body:
+ *  {
+ *    warehouseId?: string,
+ *    warehouseCode?: string,
+ *    facilityIds?: string[],
+ *    facilityCodes?: string[]
+ *  }
+ *
+ * Use this to quickly link your 15 facilities to Warehouse A.
+ */
+router.patch(
+  "/bulk/link-warehouse",
+  requireAuth,
+  requireRole("SUPER_ADMIN"),
+  async (req, res) => {
+    try {
+      const { warehouseId, warehouseCode, facilityIds, facilityCodes } = req.body || {};
+
+      if (!warehouseId && !warehouseCode) {
+        return res.status(400).json({ message: "Provide warehouseId or warehouseCode" });
+      }
+      const hasIds = Array.isArray(facilityIds) && facilityIds.length > 0;
+      const hasCodes = Array.isArray(facilityCodes) && facilityCodes.length > 0;
+      if (!hasIds && !hasCodes) {
+        return res.status(400).json({ message: "Provide facilityIds[] or facilityCodes[]" });
+      }
+
+      // find warehouse
+      let wh = null;
+      if (warehouseId) {
+        wh = await prisma.facility.findUnique({ where: { id: String(warehouseId) } });
+      } else {
+        wh = await prisma.facility.findUnique({ where: { code: String(warehouseCode).trim() } });
+      }
+      if (!wh) return res.status(404).json({ message: "Warehouse not found" });
+      if (wh.type !== "WAREHOUSE") {
+        return res.status(400).json({ message: "Target must be a WAREHOUSE facility" });
+      }
+
+      // find facilities + validate missing
+      let facilities = [];
+      let missing = [];
+
+      if (hasIds) {
+        facilities = await prisma.facility.findMany({
+          where: { id: { in: facilityIds.map(String) } },
+        });
+        const foundIds = new Set(facilities.map((f) => f.id));
+        missing = facilityIds.filter((id) => !foundIds.has(String(id)));
+      } else {
+        facilities = await prisma.facility.findMany({
+          where: { code: { in: facilityCodes.map((c) => String(c).trim()) } },
+        });
+        const foundCodes = new Set(facilities.map((f) => f.code));
+        missing = facilityCodes.filter((c) => !foundCodes.has(String(c).trim()));
+      }
+
+      // only FACILITY records can be linked
+      const nonFacility = facilities.filter((f) => f.type !== "FACILITY").map((f) => ({ id: f.id, code: f.code, type: f.type }));
+      if (nonFacility.length > 0) {
+        return res.status(400).json({
+          message: "Some records are not FACILITY and cannot be linked",
+          nonFacility,
+        });
+      }
+
+      // update
+      const idsToUpdate = facilities.map((f) => f.id);
+      const result = await prisma.facility.updateMany({
+        where: { id: { in: idsToUpdate } },
+        data: { warehouseId: wh.id },
+      });
+
+      return res.json({
+        message: "Bulk link complete",
+        warehouse: { id: wh.id, code: wh.code, name: wh.name },
+        requested: hasIds ? facilityIds.length : facilityCodes.length,
+        updated: result.count,
+        missing,
+      });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+    }
+  }
+);
+
+/**
  * GET /api/facilities
  * Roles:
  *  - SUPER_ADMIN: all
  *  - WAREHOUSE_OFFICER: own warehouse + facilities under it
- *  - FACILITY_OFFICER/CLINICIAN/VIEWER: only own facility (and optionally its warehouse if requested via /me)
+ *  - VIEWER: if assigned to a warehouse -> warehouse + facilities under it; else -> own facility
+ *  - FACILITY_OFFICER/CLINICIAN: only own facility
  *
  * Optional query: ?type=WAREHOUSE or ?type=FACILITY
  */
@@ -68,7 +209,6 @@ router.get("/", requireAuth, async (req, res) => {
   try {
     const type = req.query.type ? normalizeType(req.query.type) : null;
 
-    // --- SUPER_ADMIN: see all (optionally filtered by type)
     if (req.user.role === "SUPER_ADMIN") {
       const where = {};
       if (type) where.type = type;
@@ -77,54 +217,47 @@ router.get("/", requireAuth, async (req, res) => {
         where,
         orderBy: [{ type: "asc" }, { name: "asc" }],
       });
-
       return res.json(facilities);
     }
 
-    // --- WAREHOUSE_OFFICER: must be assigned to a warehouse (User.facilityId = warehouse id)
-    if (req.user.role === "WAREHOUSE_OFFICER") {
-      if (!req.user.facilityId) {
-        return res.status(400).json({ message: "Warehouse officer has no facilityId set" });
-      }
+    // WAREHOUSE_OFFICER or VIEWER assigned to a warehouse
+    if (req.user.role === "WAREHOUSE_OFFICER" || req.user.role === "VIEWER") {
+      if (!req.user.facilityId) return res.json([]);
 
-      const wh = await prisma.facility.findUnique({ where: { id: req.user.facilityId } });
-      if (!wh) return res.status(400).json({ message: "Your assigned warehouse facilityId was not found" });
-      if (wh.type !== "WAREHOUSE") {
-        return res.status(400).json({ message: "Your facilityId must point to a WAREHOUSE facility" });
-      }
+      const assigned = await prisma.facility.findUnique({ where: { id: req.user.facilityId } });
+      if (!assigned) return res.json([]);
 
-      // If caller filters type=WAREHOUSE -> return only their warehouse
-      if (type === "WAREHOUSE") return res.json([wh]);
+      // If assigned to warehouse: show warehouse + its facilities (good for dashboard viewer)
+      if (assigned.type === "WAREHOUSE") {
+        if (type === "WAREHOUSE") return res.json([assigned]);
 
-      // If caller filters type=FACILITY -> facilities under that warehouse
-      if (type === "FACILITY") {
+        if (type === "FACILITY") {
+          const facilities = await prisma.facility.findMany({
+            where: { type: "FACILITY", warehouseId: assigned.id },
+            orderBy: [{ name: "asc" }],
+          });
+          return res.json(facilities);
+        }
+
         const facilities = await prisma.facility.findMany({
-          where: { type: "FACILITY", warehouseId: wh.id },
-          orderBy: [{ name: "asc" }],
+          where: {
+            OR: [{ id: assigned.id }, { warehouseId: assigned.id }],
+          },
+          orderBy: [{ type: "asc" }, { name: "asc" }],
         });
         return res.json(facilities);
       }
 
-      // No type filter -> return warehouse + its facilities
-      const facilities = await prisma.facility.findMany({
-        where: {
-          OR: [{ id: wh.id }, { warehouseId: wh.id }],
-        },
-        orderBy: [{ type: "asc" }, { name: "asc" }],
-      });
-
-      return res.json(facilities);
+      // If assigned to a normal facility: only their facility
+      if (type && assigned.type !== type) return res.json([]);
+      return res.json([assigned]);
     }
 
-    // --- FACILITY users: only their own facility
+    // Other facility users: only their facility
     if (!req.user.facilityId) return res.json([]);
-
     const fac = await prisma.facility.findUnique({ where: { id: req.user.facilityId } });
     if (!fac) return res.json([]);
-
-    // If user asked for type and it doesn't match, return empty
     if (type && fac.type !== type) return res.json([]);
-
     return res.json([fac]);
   } catch (err) {
     console.error(err);
