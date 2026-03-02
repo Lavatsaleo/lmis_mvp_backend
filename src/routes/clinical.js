@@ -6,16 +6,17 @@ const { requireAuth } = require("../middleware/auth");
 const { requireRole } = require("../middleware/rbac");
 
 // ---------------- helpers ----------------
-function computeAgeInMonths(dob) {
+function computeAgeInMonths(dob, refDate = new Date()) {
   const d = new Date(dob);
-  const now = new Date();
+  const now = new Date(refDate);
   let months = (now.getFullYear() - d.getFullYear()) * 12 + (now.getMonth() - d.getMonth());
   if (now.getDate() < d.getDate()) months -= 1;
   return Math.max(0, months);
 }
 
-function buildUniqueChildNumber({ facilityCode, cwcNumber, yearOfBirth, program }) {
-  return `${facilityCode}-${cwcNumber}-${yearOfBirth}-${program}`.toUpperCase();
+function buildUniqueChildNumber({ facilityCode, cwcNumber, program }) {
+  // Registration number format: SITE/CWC/PROGRAM (e.g., KTL001/12345/SQLNS)
+  return `${facilityCode}/${cwcNumber}/${program}`.toUpperCase();
 }
 
 function isPlainObject(v) {
@@ -26,6 +27,14 @@ function parseDateOrNull(value) {
   if (!value) return null;
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function normalizeAssessmentType(v) {
+  const s = String(v || "").trim().toUpperCase();
+  if (!s) return null;
+  if (s === "ENROLLMENT" || s === "BASELINE") return "ENROLLMENT";
+  if (s === "DISCHARGE" || s === "EXIT") return "DISCHARGE";
+  return null;
 }
 
 function addLegacyChildFields(child) {
@@ -78,6 +87,118 @@ function addLegacyAssessmentFields(assessment) {
     // legacy alias
     assessedAt: assessment.assessmentDate,
   };
+}
+
+// ---------------- stock helpers ----------------
+
+/**
+ * Auto-allocate sachets from facility stock WITHOUT requiring the client to scan a box.
+ *
+ * Allocation rule (simple + safe):
+ *  - Use boxes in this facility with status IN_FACILITY
+ *  - Consume from the earliest-expiring boxes first (FEFO)
+ *  - Split across boxes if needed
+ *
+ * Returns the list of created dispense records (can be >1 if split across boxes).
+ * Throws an Error with statusCode for validation failures.
+ */
+async function autoAllocateDispenseFromFacility(tx, {
+  facilityId,
+  performedByUserId,
+  childUniqueNumber,
+  visitId,
+  quantitySachets,
+  note,
+}) {
+  const qty = Math.round(Number(quantitySachets));
+  if (!Number.isFinite(qty) || qty <= 0) {
+    const e = new Error("quantitySachets must be a positive number");
+    e.statusCode = 400;
+    throw e;
+  }
+
+  const boxes = await tx.box.findMany({
+    where: { currentFacilityId: facilityId, status: "IN_FACILITY" },
+    select: {
+      id: true,
+      boxUid: true,
+      expiryDate: true,
+      sachetsPerBox: true,
+      sachetsRemaining: true,
+      createdAt: true,
+    },
+    orderBy: [
+      { expiryDate: "asc" }, // FEFO
+      { createdAt: "asc" },
+    ],
+  });
+
+  if (!boxes || boxes.length === 0) {
+    const e = new Error("No boxes available IN_FACILITY in this facility for dispensing");
+    e.statusCode = 400;
+    throw e;
+  }
+
+  const totalAvailable = boxes.reduce((acc, b) => {
+    const perBox = Number.isFinite(b.sachetsPerBox) ? b.sachetsPerBox : 600;
+    const rem = Number.isFinite(b.sachetsRemaining) ? b.sachetsRemaining : perBox;
+    return acc + rem;
+  }, 0);
+
+  if (qty > totalAvailable) {
+    const e = new Error("Not enough sachets remaining in facility stock");
+    e.statusCode = 400;
+    e.meta = { totalAvailable, requested: qty };
+    throw e;
+  }
+
+  let remainingToAllocate = qty;
+  const createdDispenses = [];
+
+  for (const b of boxes) {
+    if (remainingToAllocate <= 0) break;
+
+    const perBox = Number.isFinite(b.sachetsPerBox) ? b.sachetsPerBox : 600;
+    const rem = Number.isFinite(b.sachetsRemaining) ? b.sachetsRemaining : perBox;
+
+    if (rem <= 0) continue;
+
+    const take = Math.min(rem, remainingToAllocate);
+    const newRemaining = rem - take;
+
+    const d = await tx.dispense.create({
+      data: {
+        visitId,
+        quantitySachets: take,
+        boxId: b.id,
+        note: note ?? null,
+      },
+    });
+
+    createdDispenses.push({ dispense: d, boxUid: b.boxUid, taken: take, remainingAfter: newRemaining });
+
+    await tx.box.update({
+      where: { id: b.id },
+      data: {
+        sachetsRemaining: newRemaining,
+        status: newRemaining === 0 ? "DISPENSED" : "IN_FACILITY",
+      },
+    });
+
+    await tx.boxEvent.create({
+      data: {
+        boxId: b.id,
+        type: "DISPENSE",
+        performedByUserId,
+        fromFacilityId: facilityId,
+        note: `Dispensed ${take} sachets to child ${childUniqueNumber} (visit ${visitId}). Remaining in box: ${newRemaining}${note ? " • " + note : ""}`,
+      },
+    });
+
+    remainingToAllocate -= take;
+  }
+
+  return createdDispenses;
 }
 
 /**
@@ -361,6 +482,16 @@ router.post(
         enrollmentDate = parsed;
       }
 
+
+      // Program eligibility: only children aged 6–23 months can be enrolled
+      const ageMonthsAtEnrollment = computeAgeInMonths(dob, enrollmentDate);
+      if (ageMonthsAtEnrollment < 6 || ageMonthsAtEnrollment > 23) {
+        return res.status(400).json({
+          message: "Child is not eligible for this program. Only children aged 6–23 months can be enrolled.",
+          ageInMonths: ageMonthsAtEnrollment,
+        });
+      }
+
       const program = body.program ? String(body.program).toUpperCase() : "SQLNS";
       if (program !== "SQLNS") {
         return res.status(400).json({ message: "Only program SQLNS is supported for now" });
@@ -369,13 +500,14 @@ router.post(
       const uniqueChildNumber = buildUniqueChildNumber({
         facilityCode: facility.code,
         cwcNumber,
-        yearOfBirth: dob.getFullYear(),
         program,
       });
 
-      // Prevent duplicate child unique number
+      // Prevent duplicates: same CWC number in the same facility (and also registration number)
       const existingChild = await prisma.child.findFirst({
-        where: { uniqueChildNumber },
+        where: {
+          OR: [{ uniqueChildNumber }, { facilityId: facility.id, cwcNumber }],
+        },
         include: { caregiver: true },
       });
       if (existingChild) {
@@ -414,6 +546,33 @@ router.post(
         };
       }
 
+
+
+      // OPTIONAL: initial dispense captured during enrollment assessment (visit)
+      // The mobile app sends this under `visit` with at least `sachetsDispensed` and `nextAppointmentDate`.
+      let enrollmentVisitInput = null;
+      if (isPlainObject(body.visit)) {
+        const v = body.visit;
+        const sachets = Number(v.sachetsDispensed ?? v.quantitySachets ?? v.sachetsGiven);
+        if (!Number.isFinite(sachets) || sachets <= 0) {
+          return res.status(400).json({ message: "visit.sachetsDispensed must be a positive number" });
+        }
+
+        let nextAppointmentDate = null;
+        if (v.nextAppointmentDate !== undefined && v.nextAppointmentDate !== null && String(v.nextAppointmentDate).trim() !== "") {
+          const parsedNext = parseDateOrNull(v.nextAppointmentDate);
+          if (!parsedNext) {
+            return res.status(400).json({ message: "visit.nextAppointmentDate must be a valid date (YYYY-MM-DD)" });
+          }
+          nextAppointmentDate = parsedNext;
+        }
+
+        enrollmentVisitInput = {
+          sachetsDispensed: Math.round(sachets),
+          nextAppointmentDate,
+          notes: v.notes ? String(v.notes) : null,
+        };
+      }
       const created = await prisma.$transaction(async (tx) => {
         // Find caregiver by same contacts in the SAME facility (MVP rule)
         let caregiver = await tx.caregiver.findFirst({
@@ -454,7 +613,6 @@ router.post(
             chpContacts: body.chpContacts ? String(body.chpContacts).trim() : null,
           },
         });
-
         // OPTIONAL: baseline in-depth assessment saved immediately
         let assessment = null;
         if (baselineAssessmentInput) {
@@ -465,6 +623,7 @@ router.post(
               childId: child.id,
               facilityId: facility.id,
               performedByUserId: req.user.id,
+              assessmentType: "ENROLLMENT",
               assessmentDate: baselineAssessmentInput.assessmentDate,
               data: baselineAssessmentInput.data,
 
@@ -473,7 +632,34 @@ router.post(
           });
         }
 
-        return { caregiver, child, assessment };
+        // OPTIONAL: record initial dispense during enrollment (no box scanning in the client)
+        let enrollmentVisit = null;
+        let enrollmentDispenses = [];
+        if (enrollmentVisitInput) {
+          enrollmentVisit = await tx.childVisit.create({
+            data: {
+              childId: child.id,
+              facilityId: facility.id,
+              performedByUserId: req.user.id,
+              visitDate: baselineAssessmentInput?.assessmentDate ?? enrollmentDate,
+              nextAppointmentDate: enrollmentVisitInput.nextAppointmentDate,
+              notes: enrollmentVisitInput.notes ?? "Enrollment dispense",
+            },
+          });
+
+          const auto = await autoAllocateDispenseFromFacility(tx, {
+            facilityId: facility.id,
+            performedByUserId: req.user.id,
+            childUniqueNumber: uniqueChildNumber,
+            visitId: enrollmentVisit.id,
+            quantitySachets: enrollmentVisitInput.sachetsDispensed,
+            note: "Enrollment dispense",
+          });
+
+          enrollmentDispenses = auto.map((a) => a.dispense);
+        }
+
+        return { caregiver, child, assessment, enrollmentVisit, enrollmentDispenses };
       });
 
       return res.status(201).json({
@@ -482,10 +668,16 @@ router.post(
         caregiver: addLegacyCaregiverFields(created.caregiver),
         child: addLegacyChildFields(created.child),
         assessment: addLegacyAssessmentFields(created.assessment),
+        visit: created.enrollmentVisit ? addLegacyVisitFields(created.enrollmentVisit) : null,
+        dispense: (created.enrollmentDispenses || []).map((d) => addLegacyDispenseFields(d, created.enrollmentVisit, created.child)),
       });
     } catch (err) {
       console.error(err);
-      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+      const status = err.statusCode || 500;
+      const payload = { message: status === 500 ? "Server error" : String(err.message || err) };
+      if (err.meta) payload.meta = err.meta;
+      if (status === 500) payload.error = String(err.message || err);
+      return res.status(status).json(payload);
     }
   }
 );
@@ -564,7 +756,7 @@ router.get(
         where: { id: req.params.childId },
         include: {
           caregiver: true,
-          inDepthAssessment: true,
+          inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
           visits: {
             orderBy: { visitDate: "desc" },
             include: {
@@ -582,10 +774,17 @@ router.get(
         return addLegacyVisitFields({ ...v, dispenses });
       });
 
+      const assessments = (child.inDepthAssessments || []).map((a) => addLegacyAssessmentFields(a));
+      const enrollmentAssessment =
+        (child.inDepthAssessments || []).find((a) => a.assessmentType === "ENROLLMENT") || null;
+
       const outChild = addLegacyChildFields({
         ...child,
         caregiver: addLegacyCaregiverFields(child.caregiver),
-        inDepthAssessment: addLegacyAssessmentFields(child.inDepthAssessment),
+        // Legacy field (older UI): enrollment assessment
+        inDepthAssessment: enrollmentAssessment ? addLegacyAssessmentFields(enrollmentAssessment) : null,
+        // New field: all assessments
+        inDepthAssessments: assessments,
         visits,
       });
 
@@ -624,20 +823,170 @@ router.post(
         visitDate = parsed;
       }
 
-      const visit = await prisma.childVisit.create({
-        data: {
-          childId: childCheck.id,
-          facilityId: childCheck.facilityId,
-          performedByUserId: req.user.id,
-          visitDate,
-          notes: body.notes ? String(body.notes) : null,
-        },
+      const weightKg = toNumberOrNull(body.weightKg ?? body.weight);
+      const heightCm = toNumberOrNull(body.heightCm ?? body.height);
+
+      const muacMmCandidate = toNumberOrNull(body.muacMm ?? body.muac);
+      const muacMm = Number.isFinite(muacMmCandidate) ? Math.round(muacMmCandidate) : null;
+
+      const whzScore = toNumberOrNull(body.whzScore ?? body.whz);
+
+      // Optional next appointment date
+      let nextAppointmentDate = null;
+      if (
+        body.nextAppointmentDate !== undefined &&
+        body.nextAppointmentDate !== null &&
+        String(body.nextAppointmentDate).trim() !== ""
+      ) {
+        const parsedNext = parseDateOrNull(body.nextAppointmentDate);
+        if (!parsedNext) {
+          return res
+            .status(400)
+            .json({ message: "nextAppointmentDate must be a valid date (YYYY-MM-DD)" });
+        }
+        nextAppointmentDate = parsedNext;
+      }
+
+      // Optional dispense payload:
+      //  - either { quantitySachets, boxUid, dispenseNote }
+      //  - or { dispenses: [{ quantitySachets, boxUid, note }, ...] }
+      const dispenseItems = Array.isArray(body.dispenses)
+        ? body.dispenses
+        : body.quantitySachets != null || body.sachetsGiven != null
+          ? [
+              {
+                quantitySachets: body.quantitySachets ?? body.sachetsGiven,
+                boxUid: body.boxUid,
+                note: body.dispenseNote ?? body.note,
+              },
+            ]
+          : [];
+
+      const result = await prisma.$transaction(async (tx) => {
+        const createdVisit = await tx.childVisit.create({
+          data: {
+            childId: childCheck.id,
+            facilityId: childCheck.facilityId,
+            performedByUserId: req.user.id,
+            visitDate,
+            notes: body.notes ? String(body.notes) : null,
+
+            // Anthropometry + WHZ
+            weightKg,
+            heightCm,
+            muacMm,
+            whzScore,
+
+            // Scheduling
+            nextAppointmentDate,
+          },
+        });
+
+        const createdDispenses = [];
+
+        for (const item of dispenseItems) {
+          const qty = Number(item?.quantitySachets ?? item?.sachetsGiven);
+          if (!Number.isFinite(qty) || qty <= 0) {
+            const e = new Error("quantitySachets must be a positive number");
+            e.statusCode = 400;
+            throw e;
+          }
+
+          const boxUid = item?.boxUid ? String(item.boxUid).trim() : null;
+          const note = item?.note ? String(item.note) : null;
+
+          // If client didn't scan a box, auto-allocate from facility stock (FEFO)
+          if (!boxUid) {
+            const auto = await autoAllocateDispenseFromFacility(tx, {
+              facilityId: childCheck.facilityId,
+              performedByUserId: req.user.id,
+              childUniqueNumber: childCheck.uniqueChildNumber,
+              visitId: createdVisit.id,
+              quantitySachets: Math.round(qty),
+              note,
+            });
+
+            for (const a of auto) {
+              createdDispenses.push(a.dispense);
+            }
+            continue;
+          }
+
+          const box = await tx.box.findUnique({ where: { boxUid } });
+          if (!box) {
+            const e = new Error("Box not found");
+            e.statusCode = 404;
+            throw e;
+          }
+
+          if (box.currentFacilityId !== childCheck.facilityId || box.status !== "IN_FACILITY") {
+            const e = new Error("Box is not available IN_FACILITY in this facility for dispensing");
+            e.statusCode = 400;
+            e.meta = { currentStatus: box.status, currentFacilityId: box.currentFacilityId };
+            throw e;
+          }
+
+          const perBox = Number.isFinite(box.sachetsPerBox) ? box.sachetsPerBox : 600;
+          const remaining = Number.isFinite(box.sachetsRemaining) ? box.sachetsRemaining : perBox;
+          const newRemaining = remaining - Math.round(qty);
+          if (newRemaining < 0) {
+            const e = new Error("Not enough sachets remaining in this box");
+            e.statusCode = 400;
+            e.meta = { sachetsRemaining: remaining, requested: Math.round(qty), boxUid };
+            throw e;
+          }
+
+          const d = await tx.dispense.create({
+            data: {
+              visitId: createdVisit.id,
+              quantitySachets: Math.round(qty),
+              boxId: box.id,
+              note,
+            },
+          });
+
+          createdDispenses.push(d);
+
+          // Update box sachet balance. Mark as DISPENSED only when empty.
+          await tx.box.update({
+            where: { id: box.id },
+            data: {
+              sachetsRemaining: newRemaining,
+              status: newRemaining === 0 ? "DISPENSED" : "IN_FACILITY",
+            },
+          });
+
+          await tx.boxEvent.create({
+            data: {
+              boxId: box.id,
+              type: "DISPENSE",
+              performedByUserId: req.user.id,
+              fromFacilityId: childCheck.facilityId,
+              note: `Dispensed ${Math.round(qty)} sachets to child ${childCheck.uniqueChildNumber} (visit ${createdVisit.id}). Remaining: ${newRemaining}`,
+            },
+          });
+        }
+
+        return { visit: createdVisit, dispenses: createdDispenses };
       });
 
-      return res.status(201).json({ message: "Visit created", visit: addLegacyVisitFields(visit) });
+      const outVisit = addLegacyVisitFields(result.visit);
+      const outDispenses = (result.dispenses || []).map((d) =>
+        addLegacyDispenseFields(d, result.visit, childCheck)
+      );
+
+      return res.status(201).json({
+        message: "Visit created",
+        visit: { ...outVisit, dispenses: outDispenses },
+      });
+
     } catch (err) {
       console.error(err);
-      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+      const status = err.statusCode || 500;
+      const payload = { message: status === 500 ? "Server error" : String(err.message || err) };
+      if (status === 500) payload.error = String(err.message || err);
+      if (err.meta) payload.meta = err.meta;
+      return res.status(status).json(payload);
     }
   }
 );
@@ -693,19 +1042,50 @@ router.post(
         });
       }
 
-      // 2) Validate box if provided
-      let box = null;
-      if (boxUid) {
-        box = await prisma.box.findUnique({ where: { boxUid } });
-        if (!box) return res.status(404).json({ message: "Box not found" });
-
-        if (box.currentFacilityId !== childCheck.facilityId || box.status !== "IN_FACILITY") {
-          return res.status(400).json({
-            message: "Box is not available IN_FACILITY in this facility for dispensing",
-            currentStatus: box.status,
-            currentFacilityId: box.currentFacilityId,
+      // If client didn't scan a box, auto-allocate from facility stock (FEFO)
+      if (!boxUid) {
+        const dispenses = await prisma.$transaction(async (tx) => {
+          const auto = await autoAllocateDispenseFromFacility(tx, {
+            facilityId: childCheck.facilityId,
+            performedByUserId: req.user.id,
+            childUniqueNumber: childCheck.uniqueChildNumber,
+            visitId: visit.id,
+            quantitySachets: Math.round(quantitySachets),
+            note,
           });
-        }
+          return auto.map((a) => a.dispense);
+        });
+
+        return res.status(201).json({
+          message: "Dispense recorded",
+          visit: addLegacyVisitFields(visit),
+          dispense: dispenses.map((d) => addLegacyDispenseFields(d, visit, childCheck)),
+        });
+      }
+
+
+      // 2) Validate box
+      const box = await prisma.box.findUnique({ where: { boxUid } });
+      if (!box) return res.status(404).json({ message: "Box not found" });
+
+      if (box.currentFacilityId !== childCheck.facilityId || box.status !== "IN_FACILITY") {
+        return res.status(400).json({
+          message: "Box is not available IN_FACILITY in this facility for dispensing",
+          currentStatus: box.status,
+          currentFacilityId: box.currentFacilityId,
+        });
+      }
+
+      const perBox = Number.isFinite(box.sachetsPerBox) ? box.sachetsPerBox : 600;
+      const remaining = Number.isFinite(box.sachetsRemaining) ? box.sachetsRemaining : perBox;
+      const newRemaining = remaining - Math.round(quantitySachets);
+      if (newRemaining < 0) {
+        return res.status(400).json({
+          message: "Not enough sachets remaining in this box",
+          sachetsRemaining: remaining,
+          requested: Math.round(quantitySachets),
+          boxUid,
+        });
       }
 
       const dispense = await prisma.$transaction(async (tx) => {
@@ -713,27 +1093,28 @@ router.post(
           data: {
             visitId: visit.id,
             quantitySachets: Math.round(quantitySachets),
-            boxId: box ? box.id : null,
+            boxId: box.id,
             note,
           },
         });
 
-        if (box) {
-          await tx.box.update({
-            where: { id: box.id },
-            data: { status: "DISPENSED" },
-          });
+        await tx.box.update({
+          where: { id: box.id },
+          data: {
+            sachetsRemaining: newRemaining,
+            status: newRemaining === 0 ? "DISPENSED" : "IN_FACILITY",
+          },
+        });
 
-          await tx.boxEvent.create({
-            data: {
-              boxId: box.id,
-              type: "DISPENSE",
-              performedByUserId: req.user.id,
-              fromFacilityId: childCheck.facilityId,
-              note: `Dispensed to child ${childCheck.uniqueChildNumber} (visit ${visit.id})`,
-            },
-          });
-        }
+        await tx.boxEvent.create({
+          data: {
+            boxId: box.id,
+            type: "DISPENSE",
+            performedByUserId: req.user.id,
+            fromFacilityId: childCheck.facilityId,
+            note: `Dispensed ${Math.round(quantitySachets)} sachets to child ${childCheck.uniqueChildNumber} (visit ${visit.id}). Remaining: ${newRemaining}`,
+          },
+        });
 
         return d;
       });
@@ -745,7 +1126,11 @@ router.post(
       });
     } catch (err) {
       console.error(err);
-      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+      const status = err.statusCode || 500;
+      const payload = { message: status === 500 ? "Server error" : String(err.message || err) };
+      if (status === 500) payload.error = String(err.message || err);
+      if (err.meta) payload.meta = err.meta;
+      return res.status(status).json(payload);
     }
   }
 );
@@ -802,17 +1187,22 @@ router.post(
       if (!childCheck) return res.status(404).json({ message: "Child not found" });
       if (childCheck === "FORBIDDEN") return res.status(403).json({ message: "Forbidden" });
 
+      const body = req.body || {};
+      const assessmentType =
+        normalizeAssessmentType(req.query.type ?? body.assessmentType ?? body.type) || "ENROLLMENT";
+
       const existing = await prisma.inDepthAssessment.findUnique({
-        where: { childId: childCheck.id },
+        where: { childId_assessmentType: { childId: childCheck.id, assessmentType } },
       });
       if (existing) {
-        return res
-          .status(409)
-          .json({ message: "In-depth assessment already exists for this child", assessment: existing });
+        return res.status(409).json({
+          message: `In-depth assessment already exists for this child (${assessmentType})`,
+          assessment: existing,
+        });
       }
 
       // strict date validation if client provides one
-      const rawDate = (req.body || {}).assessmentDate ?? (req.body || {}).assessedAt;
+      const rawDate = body.assessmentDate ?? body.assessedAt;
       if (rawDate !== undefined && rawDate !== null && String(rawDate).trim() !== "") {
         const parsed = parseDateOrNull(rawDate);
         if (!parsed) {
@@ -820,7 +1210,7 @@ router.post(
         }
       }
 
-      const normalized = normalizeAssessmentPayload(req.body || {});
+      const normalized = normalizeAssessmentPayload(body);
       if (!isPlainObject(normalized.data)) {
         return res.status(400).json({ message: "Assessment data must be an object (send { data: {...} })" });
       }
@@ -833,6 +1223,7 @@ router.post(
           childId: childCheck.id,
           facilityId: childCheck.facilityId,
           performedByUserId: req.user.id,
+          assessmentType,
           assessmentDate: normalized.assessmentDate,
           data: enrichedData,
           ...quick,
@@ -861,11 +1252,16 @@ router.get(
       if (!childCheck) return res.status(404).json({ message: "Child not found" });
       if (childCheck === "FORBIDDEN") return res.status(403).json({ message: "Forbidden" });
 
+      const assessmentType = normalizeAssessmentType(req.query.type) || "ENROLLMENT";
+
       const assessment = await prisma.inDepthAssessment.findUnique({
-        where: { childId: childCheck.id },
+        where: { childId_assessmentType: { childId: childCheck.id, assessmentType } },
       });
 
-      return res.json({ assessment: assessment ? addLegacyAssessmentFields(assessment) : null });
+      return res.json({
+        assessmentType,
+        assessment: assessment ? addLegacyAssessmentFields(assessment) : null,
+      });
     } catch (err) {
       console.error(err);
       return res.status(500).json({ message: "Server error", error: String(err.message || err) });
@@ -887,12 +1283,18 @@ router.put(
       if (!childCheck) return res.status(404).json({ message: "Child not found" });
       if (childCheck === "FORBIDDEN") return res.status(403).json({ message: "Forbidden" });
 
-      const existing = await prisma.inDepthAssessment.findUnique({
-        where: { childId: childCheck.id },
-      });
-      if (!existing) return res.status(404).json({ message: "No in-depth assessment found for this child" });
-
       const body = req.body || {};
+      const assessmentType =
+        normalizeAssessmentType(req.query.type ?? body.assessmentType ?? body.type) || "ENROLLMENT";
+
+      const existing = await prisma.inDepthAssessment.findUnique({
+        where: { childId_assessmentType: { childId: childCheck.id, assessmentType } },
+      });
+      if (!existing) {
+        return res.status(404).json({
+          message: `No in-depth assessment found for this child (${assessmentType})`,
+        });
+      }
 
       // Only update date if provided
       let assessmentDate = existing.assessmentDate;

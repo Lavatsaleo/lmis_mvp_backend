@@ -38,6 +38,20 @@ enum BoxEventType {
   ADJUSTMENT
 }
 
+enum ShipmentStatus {
+  DISPATCHED
+  RECEIVED
+  CANCELLED
+}
+
+//
+// NEW: assessment type so we can store ENROLLMENT + DISCHARGE assessments per child
+//
+enum AssessmentType {
+  ENROLLMENT
+  DISCHARGE
+}
+
 model Facility {
   id   String       @id @default(cuid())
   code String       @unique
@@ -64,6 +78,10 @@ model Facility {
   // Facility-level history: events where this facility is the destination
   inboundEvents BoxEvent[] @relation("toFacility")
 
+  // Shipments / Manifests
+  outboundShipments Shipment[] @relation("ShipmentsFromWarehouse")
+  inboundShipments  Shipment[] @relation("ShipmentsToFacility")
+
   // Clinical
   caregivers  Caregiver[]
   children    Child[]
@@ -88,11 +106,16 @@ model User {
   boxEvents BoxEvent[] @relation("PerformedBoxEvents")
 
   // Clinical actions performed by this user
-  childVisits  ChildVisit[]       @relation("PerformedVisits")
-  assessments  InDepthAssessment[] @relation("PerformedAssessments")
+  childVisits ChildVisit[]        @relation("PerformedVisits")
+  assessments InDepthAssessment[] @relation("PerformedAssessments")
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  // Shipments / Manifests
+  dispatchedShipments Shipment[] @relation("ShipmentsDispatchedBy")
+  receivedShipments   Shipment[] @relation("ShipmentsReceivedBy")
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  shipmentItems ShipmentItem[]
 
   @@index([facilityId])
   @@index([role])
@@ -125,6 +148,12 @@ model Box {
   status     BoxStatus @default(CREATED)
   createdAt  DateTime  @default(now())
 
+  // --- Facility store tracking (each box contains sachets) ---
+  // Default: 600 sachets per box
+  sachetsPerBox    Int @default(600)
+  // Remaining sachets in this box (decrements as clinicians dispense)
+  sachetsRemaining Int @default(600)
+
   currentFacilityId String?
   currentFacility   Facility? @relation("currentFacility", fields: [currentFacilityId], references: [id])
 
@@ -134,6 +163,9 @@ model Box {
 
   // Optional: link a dispensation record to this box (clinical)
   dispenses Dispense[]
+
+  // Shipments / Manifests
+  shipmentItems ShipmentItem[]
 
   @@index([orderId])
   @@index([productId])
@@ -152,7 +184,7 @@ model BoxEvent {
   note              String?
   createdAt         DateTime     @default(now())
 
-  box         Box  @relation(fields: [boxId], references: [id])
+  box Box @relation(fields: [boxId], references: [id])
 
   performedBy User @relation("PerformedBoxEvents", fields: [performedByUserId], references: [id])
 
@@ -166,12 +198,65 @@ model BoxEvent {
   @@index([type])
 }
 
+model Shipment {
+  id         String         @id @default(cuid())
+  manifestNo String         @unique
+  status     ShipmentStatus @default(DISPATCHED)
+
+  note String?
+
+  fromWarehouseId String
+  toFacilityId    String
+
+  dispatchedByUserId String
+  dispatchedAt       DateTime @default(now())
+
+  receivedByUserId String?
+  receivedAt       DateTime?
+
+  // For idempotent dispatch retries
+  idempotencyKey String? @unique
+
+  fromWarehouse Facility @relation("ShipmentsFromWarehouse", fields: [fromWarehouseId], references: [id])
+  toFacility    Facility @relation("ShipmentsToFacility", fields: [toFacilityId], references: [id])
+
+  dispatchedBy User  @relation("ShipmentsDispatchedBy", fields: [dispatchedByUserId], references: [id])
+  receivedBy   User? @relation("ShipmentsReceivedBy", fields: [receivedByUserId], references: [id])
+
+  items ShipmentItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([fromWarehouseId])
+  @@index([toFacilityId])
+  @@index([status])
+  @@index([dispatchedAt])
+}
+
+model ShipmentItem {
+  id         String @id @default(cuid())
+  shipmentId String
+  boxId      String
+
+  receivedAt       DateTime?
+  receivedByUserId String?
+
+  shipment   Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  box        Box      @relation(fields: [boxId], references: [id])
+  receivedBy User?    @relation(fields: [receivedByUserId], references: [id])
+
+  @@unique([shipmentId, boxId])
+  @@index([shipmentId])
+  @@index([boxId])
+}
+
 //
 // -------------------- CLINICAL --------------------
 //
 
 model Caregiver {
-  id         String   @id @default(cuid())
+  id         String  @id @default(cuid())
   facilityId String
   fullName   String
   contacts   String
@@ -190,27 +275,27 @@ model Caregiver {
 }
 
 model Child {
-  id             String   @id @default(cuid())
-  facilityId     String
-  caregiverId    String
+  id          String @id @default(cuid())
+  facilityId  String
+  caregiverId String
 
   // Program code (for now SQLNS, but keep as String for flexibility/MVP)
-  program        String   @default("SQLNS")
+  program String @default("SQLNS")
 
   enrollmentDate DateTime @default(now())
 
-  firstName      String
-  lastName       String
-  sex            String
-  dateOfBirth    DateTime
-  cwcNumber      String
+  firstName   String
+  lastName    String
+  sex         String
+  dateOfBirth DateTime
+  cwcNumber   String
 
-  // Your “silver bullet” unique child number (facilityCode/cwc/year/program) built in API, stored here
+  // System-generated registration number (facilityCode/cwcNumber/program)
   uniqueChildNumber String @unique
 
   // Optional CHP details from registration form
-  chpName      String?
-  chpContacts  String?
+  chpName     String?
+  chpContacts String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -220,9 +305,10 @@ model Child {
 
   visits ChildVisit[]
 
-  // One in-depth assessment immediately after registration (Option 1)
-  inDepthAssessment InDepthAssessment?
+  // NOW: can store ENROLLMENT + DISCHARGE assessments (and potentially more in future)
+  inDepthAssessments InDepthAssessment[]
 
+  @@unique([facilityId, cwcNumber])
   @@index([facilityId])
   @@index([caregiverId])
   @@index([lastName, firstName])
@@ -231,10 +317,13 @@ model Child {
 }
 
 model InDepthAssessment {
-  id                String   @id @default(cuid())
-  childId            String   @unique
-  facilityId         String
-  performedByUserId  String
+  id                String @id @default(cuid())
+  childId           String
+  facilityId        String
+  performedByUserId String
+
+  // NEW: to store ENROLLMENT + DISCHARGE per child
+  assessmentType AssessmentType @default(ENROLLMENT)
 
   // When the assessment was done (default now, but you can set from form)
   assessmentDate DateTime @default(now())
@@ -243,26 +332,29 @@ model InDepthAssessment {
   data Json
 
   // OPTIONAL: store a few key values for dashboards (fast queries)
-  muacMm              Int?
-  weightKg            Float?
-  heightCm            Float?
-  householdHungerScore Int?
+  muacMm                  Int?
+  weightKg                Float?
+  heightCm                Float?
+  householdHungerScore    Int?
   householdHungerCategory String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  child       Child     @relation(fields: [childId], references: [id])
-  facility    Facility  @relation(fields: [facilityId], references: [id])
-  performedBy User      @relation("PerformedAssessments", fields: [performedByUserId], references: [id])
+  child       Child    @relation(fields: [childId], references: [id])
+  facility    Facility @relation(fields: [facilityId], references: [id])
+  performedBy User     @relation("PerformedAssessments", fields: [performedByUserId], references: [id])
 
+  // IMPORTANT: allows ONE enrollment + ONE discharge per child
+  @@unique([childId, assessmentType])
   @@index([facilityId])
   @@index([performedByUserId])
   @@index([assessmentDate])
+  @@index([assessmentType])
 }
 
 model ChildVisit {
-  id               String   @id @default(cuid())
+  id                String @id @default(cuid())
   childId           String
   facilityId        String
   performedByUserId String
@@ -270,11 +362,20 @@ model ChildVisit {
   visitDate DateTime
   notes     String?
 
+  // NEW: Anthropometry captured during follow-up visits (and can be used for diary/attendance)
+  weightKg Float?
+  heightCm Float?
+  muacMm   Int?
+  whzScore Float?
+
+  // NEW: Next appointment date stored ONLY in child visits
+  nextAppointmentDate DateTime?
+
   createdAt DateTime @default(now())
 
-  child       Child     @relation(fields: [childId], references: [id])
-  facility    Facility  @relation(fields: [facilityId], references: [id])
-  performedBy User      @relation("PerformedVisits", fields: [performedByUserId], references: [id])
+  child       Child    @relation(fields: [childId], references: [id])
+  facility    Facility @relation(fields: [facilityId], references: [id])
+  performedBy User     @relation("PerformedVisits", fields: [performedByUserId], references: [id])
 
   dispenses Dispense[]
 
@@ -282,21 +383,22 @@ model ChildVisit {
   @@index([facilityId])
   @@index([performedByUserId])
   @@index([visitDate])
+  @@index([nextAppointmentDate])
 }
 
 model Dispense {
-  id        String   @id @default(cuid())
-  visitId   String
-  boxId     String?  // optional if dispensing without scanning a box (future)
+  id              String  @id @default(cuid())
+  visitId         String
+  boxId           String? // optional if dispensing without scanning a box (future)
   quantitySachets Int
-  note      String?
+  note            String?
 
   createdAt DateTime @default(now())
 
   visit ChildVisit @relation(fields: [visitId], references: [id])
 
   // Link to box if scanned
-  box   Box? @relation(fields: [boxId], references: [id])
+  box Box? @relation(fields: [boxId], references: [id])
 
   @@index([visitId])
   @@index([boxId])

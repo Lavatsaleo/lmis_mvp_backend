@@ -12,7 +12,10 @@ const txRoutes = require("./routes/transactions");
 const orderRoutes = require("./routes/orders");
 const facilityRoutes = require("./routes/facilities");
 const clinicalRoutes = require("./routes/clinical");
+const shipmentRoutes = require("./routes/shipments");
 
+// ✅ ADD THIS (new)
+const dashboardRoutes = require("./routes/dashboard");
 
 const app = express();
 
@@ -32,7 +35,10 @@ app.use("/api/transactions", txRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/facilities", facilityRoutes);
 app.use("/api/clinical", clinicalRoutes);
+app.use("/api/shipments", shipmentRoutes);
 
+// ✅ ADD THIS (new) — keep it BEFORE app.use("/api", userRoutes)
+app.use("/api/dashboard", dashboardRoutes);
 
 // Keep /api (me + users) last
 app.use("/api", userRoutes);

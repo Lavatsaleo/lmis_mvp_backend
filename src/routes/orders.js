@@ -134,6 +134,10 @@ router.post(
               expiryDate: exp,
               status: "IN_WAREHOUSE",
               currentFacilityId: warehouse.id,
+
+              // Facility store tracking
+              sachetsPerBox: 600,
+              sachetsRemaining: 600,
             },
           });
 
