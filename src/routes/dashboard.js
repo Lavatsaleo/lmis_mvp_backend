@@ -784,7 +784,9 @@ router.get("/children", requireAuth, async (req, res) => {
 
 // -----------------------------------------------------------------------------
 // GET /api/dashboard/children/:childId/measurements
-// Returns MUAC/weight/height trends (no names)
+// Returns visit rows for the child details page. Safely enriches the enrollment
+// row with anthropometry captured during the in-depth assessment and exposes
+// sachets dispensed per visit.
 // -----------------------------------------------------------------------------
 router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
   try {
@@ -809,7 +811,64 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const [visits, assessments] = await Promise.all([
+    const toNumberOrNull = (value) => {
+      if (value === null || value === undefined || value === "") return null;
+      const n = typeof value === "number" ? value : Number(String(value).trim());
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const dateKey = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      return d.toISOString().slice(0, 10);
+    };
+
+    const firstFinite = (...values) => {
+      for (const value of values) {
+        const n = toNumberOrNull(value);
+        if (n !== null) return n;
+      }
+      return null;
+    };
+
+    const firstValue = (...values) => {
+      for (const value of values) {
+        if (value !== null && value !== undefined && value !== "") return value;
+      }
+      return null;
+    };
+
+    const pickFromData = (data, keys) => {
+      if (!data || typeof data !== "object") return null;
+      for (const key of keys) {
+        const direct = toNumberOrNull(data?.[key]);
+        if (direct !== null) return direct;
+      }
+
+      const nestedSources = [
+        data.answers,
+        data.anthropometry,
+        data.measurements,
+        data.measurement,
+        data.child,
+        data.baseline,
+      ].filter((value) => value && typeof value === "object");
+
+      for (const source of nestedSources) {
+        for (const key of keys) {
+          const nested = toNumberOrNull(source?.[key]);
+          if (nested !== null) return nested;
+        }
+      }
+
+      return null;
+    };
+
+    const sumDispenses = (dispenses) =>
+      (dispenses || []).reduce((sum, item) => sum + (Number(item?.quantitySachets) || 0), 0);
+
+    const [visitsRaw, assessments] = await Promise.all([
       prisma.childVisit.findMany({
         where: { childId: child.id },
         orderBy: { visitDate: "asc" },
@@ -821,6 +880,12 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
           muacMm: true,
           whzScore: true,
           nextAppointmentDate: true,
+          dispenses: {
+            select: {
+              id: true,
+              quantitySachets: true,
+            },
+          },
         },
       }),
       prisma.inDepthAssessment.findMany({
@@ -833,9 +898,71 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
           weightKg: true,
           heightCm: true,
           muacMm: true,
+          data: true,
         },
       }),
     ]);
+
+    const visits = visitsRaw.map((visit) => ({
+      id: visit.id,
+      visitDate: visit.visitDate,
+      weightKg: visit.weightKg,
+      heightCm: visit.heightCm,
+      muacMm: visit.muacMm,
+      whzScore: visit.whzScore,
+      nextAppointmentDate: visit.nextAppointmentDate,
+      sachetsDispensed: sumDispenses(visit.dispenses),
+    }));
+
+    const enrollmentAssessment =
+      assessments.find((assessment) => assessment.assessmentType === "ENROLLMENT") ||
+      assessments[0] ||
+      null;
+
+    if (enrollmentAssessment) {
+      const enrollmentDateKey =
+        dateKey(enrollmentAssessment.assessmentDate) || dateKey(child.enrollmentDate);
+
+      const assessmentWeight = firstFinite(
+        enrollmentAssessment.weightKg,
+        pickFromData(enrollmentAssessment.data, ["weightKg", "weight", "childWeightKg", "baselineWeightKg"])
+      );
+      const assessmentHeight = firstFinite(
+        enrollmentAssessment.heightCm,
+        pickFromData(enrollmentAssessment.data, ["heightCm", "height", "lengthCm", "childHeightCm", "baselineHeightCm"])
+      );
+      const assessmentMuac = firstFinite(
+        enrollmentAssessment.muacMm,
+        pickFromData(enrollmentAssessment.data, ["muacMm", "muac", "muacMM", "baselineMuacMm"])
+      );
+      const assessmentWhz = firstFinite(
+        pickFromData(enrollmentAssessment.data, ["whzScore", "whz", "zScore", "weightForHeightZScore"])
+      );
+
+      const matchingVisitIndex = visits.findIndex((visit) => dateKey(visit.visitDate) === enrollmentDateKey);
+
+      if (matchingVisitIndex >= 0) {
+        const existing = visits[matchingVisitIndex];
+        visits[matchingVisitIndex] = {
+          ...existing,
+          weightKg: firstValue(existing.weightKg, assessmentWeight),
+          heightCm: firstValue(existing.heightCm, assessmentHeight),
+          muacMm: firstValue(existing.muacMm, assessmentMuac),
+          whzScore: firstValue(existing.whzScore, assessmentWhz),
+        };
+      } else {
+        visits.unshift({
+          id: `assessment-${enrollmentAssessment.id}`,
+          visitDate: enrollmentAssessment.assessmentDate || child.enrollmentDate,
+          weightKg: assessmentWeight,
+          heightCm: assessmentHeight,
+          muacMm: assessmentMuac,
+          whzScore: assessmentWhz,
+          nextAppointmentDate: null,
+          sachetsDispensed: 0,
+        });
+      }
+    }
 
     return res.json({ child, visits, assessments });
   } catch (err) {

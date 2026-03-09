@@ -57,10 +57,26 @@ function addLegacyCaregiverFields(caregiver) {
   };
 }
 
+function sumVisitSachets(visit) {
+  if (!visit) return 0;
+  if (Array.isArray(visit.dispenses)) {
+    return visit.dispenses.reduce((sum, d) => sum + Math.round(Number(d?.quantitySachets || 0)), 0);
+  }
+
+  const direct = Number(visit.sachetsDispensed ?? visit.quantitySachets ?? visit.sachetsGiven);
+  return Number.isFinite(direct) ? Math.round(direct) : 0;
+}
+
 function addLegacyVisitFields(visit) {
   if (!visit) return visit;
+
+  const sachetsDispensed = sumVisitSachets(visit);
+
   return {
     ...visit,
+    sachetsDispensed,
+    quantitySachets: sachetsDispensed,
+    sachetsGiven: sachetsDispensed,
     // legacy alias
     createdByUserId: visit.performedByUserId,
   };
@@ -330,6 +346,66 @@ function enrichAssessmentData(data) {
  * Extract a few “fast query” fields from the assessment JSON.
  * We keep this defensive because your frontend field names may evolve.
  */
+function sameDay(a, b) {
+  if (!a || !b) return false;
+  const da = new Date(a);
+  const db = new Date(b);
+  return (
+    da.getFullYear() === db.getFullYear() &&
+    da.getMonth() === db.getMonth() &&
+    da.getDate() === db.getDate()
+  );
+}
+
+function extractAssessmentVisitMetrics(data) {
+  const quick = extractAssessmentQuickFields(data);
+  const d = data || {};
+
+  const whzScore =
+    toNumberOrNull(d.whzScore) ??
+    toNumberOrNull(d.whz) ??
+    toNumberOrNull(d?.anthropometrics?.whzScore) ??
+    toNumberOrNull(d?.anthropometrics?.whz) ??
+    toNumberOrNull(d?.answers?.whzScore) ??
+    toNumberOrNull(d?.answers?.whz) ??
+    toNumberOrNull(d?.answers?.anthropometrics?.whzScore) ??
+    toNumberOrNull(d?.answers?.anthropometrics?.whz);
+
+  return {
+    weightKg: quick.weightKg,
+    heightCm: quick.heightCm,
+    muacMm: quick.muacMm,
+    whzScore: Number.isFinite(whzScore) ? whzScore : null,
+  };
+}
+
+function visitHasAnthroMetrics(visit) {
+  if (!visit) return false;
+  return [visit.weightKg, visit.heightCm, visit.muacMm, visit.whzScore].some((v) => v !== null && v !== undefined && v !== "");
+}
+
+function enrichVisitFromAssessmentIfNeeded(visit, assessment) {
+  if (!visit || !assessment) return visit;
+  if (visitHasAnthroMetrics(visit)) return visit;
+
+  const looksLikeEnrollmentVisit =
+    /enrollment/i.test(String(visit.notes || "")) ||
+    sameDay(visit.visitDate, assessment.assessmentDate);
+
+  if (!looksLikeEnrollmentVisit) return visit;
+
+  const metrics = extractAssessmentVisitMetrics(assessment.data);
+
+  return {
+    ...visit,
+    weightKg: visit.weightKg ?? metrics.weightKg,
+    heightCm: visit.heightCm ?? metrics.heightCm,
+    muacMm: visit.muacMm ?? metrics.muacMm,
+    whzScore: visit.whzScore ?? metrics.whzScore,
+    source: visit.source || "VISIT_WITH_ENROLLMENT_ASSESSMENT",
+  };
+}
+
 function extractAssessmentQuickFields(data) {
   const d = data || {};
 
@@ -636,6 +712,10 @@ router.post(
         let enrollmentVisit = null;
         let enrollmentDispenses = [];
         if (enrollmentVisitInput) {
+          const baselineVisitMetrics = baselineAssessmentInput
+            ? extractAssessmentVisitMetrics(baselineAssessmentInput.data)
+            : {};
+
           enrollmentVisit = await tx.childVisit.create({
             data: {
               childId: child.id,
@@ -644,6 +724,10 @@ router.post(
               visitDate: baselineAssessmentInput?.assessmentDate ?? enrollmentDate,
               nextAppointmentDate: enrollmentVisitInput.nextAppointmentDate,
               notes: enrollmentVisitInput.notes ?? "Enrollment dispense",
+              weightKg: baselineVisitMetrics.weightKg ?? null,
+              heightCm: baselineVisitMetrics.heightCm ?? null,
+              muacMm: baselineVisitMetrics.muacMm ?? null,
+              whzScore: baselineVisitMetrics.whzScore ?? null,
             },
           });
 
@@ -769,14 +853,40 @@ router.get(
         },
       });
 
-      const visits = (child.visits || []).map((v) => {
-        const dispenses = (v.dispenses || []).map((d) => addLegacyDispenseFields(d, v, child));
-        return addLegacyVisitFields({ ...v, dispenses });
-      });
-
-      const assessments = (child.inDepthAssessments || []).map((a) => addLegacyAssessmentFields(a));
       const enrollmentAssessment =
         (child.inDepthAssessments || []).find((a) => a.assessmentType === "ENROLLMENT") || null;
+
+      const visits = (child.visits || []).map((v) => {
+        const dispenses = (v.dispenses || []).map((d) => addLegacyDispenseFields(d, v, child));
+        const enrichedVisit = enrichVisitFromAssessmentIfNeeded({ ...v, dispenses }, enrollmentAssessment);
+        return addLegacyVisitFields(enrichedVisit);
+      });
+
+      if (enrollmentAssessment) {
+        const alreadyRepresented = visits.some((v) => sameDay(v.visitDate, enrollmentAssessment.assessmentDate));
+
+        if (!alreadyRepresented) {
+          visits.push(
+            addLegacyVisitFields({
+              id: `assessment-${enrollmentAssessment.id}`,
+              childId: child.id,
+              facilityId: child.facilityId,
+              performedByUserId: enrollmentAssessment.performedByUserId,
+              visitDate: enrollmentAssessment.assessmentDate,
+              notes: "Enrollment assessment",
+              nextAppointmentDate: null,
+              dispenses: [],
+              source: "ENROLLMENT_ASSESSMENT",
+              ...extractAssessmentVisitMetrics(enrollmentAssessment.data),
+              createdAt: enrollmentAssessment.createdAt,
+            })
+          );
+        }
+
+        visits.sort((a, b) => new Date(b.visitDate).getTime() - new Date(a.visitDate).getTime());
+      }
+
+      const assessments = (child.inDepthAssessments || []).map((a) => addLegacyAssessmentFields(a));
 
       const outChild = addLegacyChildFields({
         ...child,
