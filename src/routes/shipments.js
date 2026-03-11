@@ -18,6 +18,16 @@ function safeDate(d) {
   }
 }
 
+function safeDateTime(d) {
+  try {
+    const x = new Date(d);
+    if (Number.isNaN(x.getTime())) return '';
+    return x.toLocaleString();
+  } catch (_) {
+    return '';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/shipments
 // Query (optional): status=DISPATCHED|RECEIVED|CANCELLED
@@ -185,6 +195,7 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
         fromWarehouse: { select: { code: true, name: true } },
         toFacility: { select: { code: true, name: true } },
         dispatchedBy: { select: { fullName: true } },
+        receivedBy: { select: { fullName: true } },
         items: {
           orderBy: { id: 'asc' },
           include: {
@@ -300,6 +311,77 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
     doc.text('Facility Receiver Name: ___________________   Signature: ___________________________');
     doc.moveDown(0.6);
     doc.text('Date Received: ____________________________');
+
+    // Official received stamp only when shipment has been received
+    if (shipment.status === 'RECEIVED') {
+      doc.moveDown(1.0);
+
+      if (doc.y > doc.page.height - doc.page.margins.bottom - 120) {
+        doc.addPage();
+      }
+
+      const stampW = 220;
+      const stampH = 88;
+      const stampX = doc.page.width - doc.page.margins.right - stampW;
+      const stampY = doc.y + 4;
+
+      // Outer official border
+      doc
+        .save()
+        .lineWidth(2.5)
+        .strokeColor('#b71c1c')
+        .roundedRect(stampX, stampY, stampW, stampH, 10)
+        .stroke();
+
+      // Inner border
+      doc
+        .lineWidth(1)
+        .roundedRect(stampX + 6, stampY + 6, stampW - 12, stampH - 12, 8)
+        .stroke();
+
+      // Title
+      doc
+        .fillColor('#b71c1c')
+        .font('Helvetica-Bold')
+        .fontSize(17)
+        .text('GOODS RECEIVED', stampX, stampY + 10, {
+          width: stampW,
+          align: 'center',
+        });
+
+      // Divider
+      doc
+        .moveTo(stampX + 14, stampY + 34)
+        .lineTo(stampX + stampW - 14, stampY + 34)
+        .stroke();
+
+      // Stamp details
+      doc
+        .fillColor('#111111')
+        .font('Helvetica-Bold')
+        .fontSize(9)
+        .text('Received By:', stampX + 14, stampY + 42, { continued: true })
+        .font('Helvetica')
+        .text(` ${shipment.receivedBy?.fullName || '—'}`);
+
+      doc
+        .font('Helvetica-Bold')
+        .text('Date & Time:', stampX + 14, stampY + 58, { continued: true })
+        .font('Helvetica')
+        .text(` ${safeDateTime(shipment.receivedAt) || '—'}`);
+
+      doc
+        .font('Helvetica-Oblique')
+        .fontSize(8)
+        .fillColor('#b71c1c')
+        .text('Verified receiving record', stampX, stampY + 74, {
+          width: stampW,
+          align: 'center',
+        });
+
+      doc.restore();
+      doc.moveDown(6);
+    }
 
     doc.end();
   } catch (err) {
