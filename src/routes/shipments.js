@@ -30,12 +30,15 @@ function safeDate(d) {
 router.get('/', requireAuth, async (req, res) => {
   try {
     const status = req.query.status ? String(req.query.status).trim().toUpperCase() : null;
-    const includeReceived = String(req.query.includeReceived || '').toLowerCase() === 'true' || String(req.query.includeReceived || '') === '1';
+    const includeReceived =
+      String(req.query.includeReceived || '').toLowerCase() === 'true' ||
+      String(req.query.includeReceived || '') === '1';
+
     const where = {};
 
     // Default behaviour (when status is NOT provided):
     // - Facility users: hide RECEIVED shipments so the manifest picker stays short.
-    // - Warehouse users: show all by default (they may need to reprint waybills).
+    // - Warehouse users: show all by default.
     // - Client can always request history via includeReceived=true OR status=RECEIVED.
     if (status) {
       where.status = status;
@@ -51,7 +54,12 @@ router.get('/', requireAuth, async (req, res) => {
       if (req.query.fromWarehouseId) where.fromWarehouseId = String(req.query.fromWarehouseId);
       if (req.query.toFacilityId) where.toFacilityId = String(req.query.toFacilityId);
     } else if (req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') {
-      const myWarehouseId = req.user.warehouseId ? String(req.user.warehouseId) : (req.user.facilityId ? String(req.user.facilityId) : null);
+      const myWarehouseId = req.user.warehouseId
+        ? String(req.user.warehouseId)
+        : req.user.facilityId
+        ? String(req.user.facilityId)
+        : null;
+
       if (!myWarehouseId) return res.json([]);
       where.fromWarehouseId = myWarehouseId;
     } else {
@@ -68,21 +76,33 @@ router.get('/', requireAuth, async (req, res) => {
         fromWarehouse: { select: { id: true, code: true, name: true } },
         toFacility: { select: { id: true, code: true, name: true } },
         dispatchedBy: { select: { id: true, fullName: true, role: true } },
+        receivedBy: { select: { id: true, fullName: true, role: true } },
         _count: { select: { items: true } },
       },
     });
 
-    return res.json(shipments.map((s) => ({
-      id: s.id,
-      manifestNo: s.manifestNo,
-      status: s.status,
-      note: s.note,
-      fromWarehouse: s.fromWarehouse,
-      toFacility: s.toFacility,
-      dispatchedBy: s.dispatchedBy,
-      dispatchedAt: s.dispatchedAt,
-      itemCount: s._count.items,
-    })));
+    return res.json(
+      shipments.map((s) => ({
+        id: s.id,
+        manifestNo: s.manifestNo,
+        status: s.status,
+        note: s.note,
+
+        fromWarehouse: s.fromWarehouse,
+        toFacility: s.toFacility,
+
+        dispatchedBy: s.dispatchedBy,
+        receivedBy: s.receivedBy,
+
+        dispatchedAt: s.dispatchedAt,
+        receivedAt: s.receivedAt || null,
+
+        itemCount: s._count.items,
+        boxesCount: s._count.items,
+
+        waybillUrl: `/api/shipments/${s.id}/waybill.pdf`,
+      }))
+    );
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: 'Server error', error: String(err.message || err) });
@@ -107,7 +127,16 @@ router.get('/:shipmentId', requireAuth, async (req, res) => {
         items: {
           orderBy: { id: 'asc' },
           include: {
-            box: { select: { id: true, boxUid: true, batchNo: true, expiryDate: true, status: true, product: { select: { code: true, name: true } } } },
+            box: {
+              select: {
+                id: true,
+                boxUid: true,
+                batchNo: true,
+                expiryDate: true,
+                status: true,
+                product: { select: { code: true, name: true } },
+              },
+            },
           },
         },
       },
@@ -118,7 +147,12 @@ router.get('/:shipmentId', requireAuth, async (req, res) => {
     // Scoping
     if (req.user.role !== 'SUPER_ADMIN') {
       if (req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') {
-        const myWarehouseId = req.user.warehouseId ? String(req.user.warehouseId) : (req.user.facilityId ? String(req.user.facilityId) : null);
+        const myWarehouseId = req.user.warehouseId
+          ? String(req.user.warehouseId)
+          : req.user.facilityId
+          ? String(req.user.facilityId)
+          : null;
+
         if (!myWarehouseId || String(shipment.fromWarehouseId) !== myWarehouseId) {
           return res.status(403).json({ message: 'Forbidden' });
         }
@@ -173,7 +207,12 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
     // Scoping: same rules as detail
     if (req.user.role !== 'SUPER_ADMIN') {
       if (req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') {
-        const myWarehouseId = req.user.warehouseId ? String(req.user.warehouseId) : (req.user.facilityId ? String(req.user.facilityId) : null);
+        const myWarehouseId = req.user.warehouseId
+          ? String(req.user.warehouseId)
+          : req.user.facilityId
+          ? String(req.user.facilityId)
+          : null;
+
         if (!myWarehouseId || String(shipment.fromWarehouseId) !== myWarehouseId) {
           return res.status(403).json({ message: 'Forbidden' });
         }
@@ -203,7 +242,6 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
     doc.text(`To (Facility): ${shipment.toFacility.name} (${shipment.toFacility.code})`);
     doc.text(`Dispatched by: ${shipment.dispatchedBy.fullName}`);
 
-    // Small meta from first box/order
     const first = shipment.items[0]?.box;
     const donor = first?.order?.donorName || '';
     const orderNo = first?.order?.orderNumber || '';
@@ -212,7 +250,6 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
 
     doc.moveDown(0.8);
 
-    // Table header
     const startX = doc.x;
     const pageW = doc.page.width - doc.page.margins.left - doc.page.margins.right;
     const col1 = startX;
@@ -230,9 +267,9 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
     doc.moveDown(0.4);
     doc.font('Helvetica');
 
-    // Rows
     const rowH = 14;
     let i = 1;
+
     for (const it of shipment.items) {
       const b = it.box;
       if (doc.y > doc.page.height - doc.page.margins.bottom - 90) {
@@ -243,7 +280,6 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
       doc.text(b.boxUid, col2, y, { width: pageW * 0.48 });
       doc.text(b.batchNo || '', col3, y, { width: pageW * 0.14 });
       doc.text(safeDate(b.expiryDate), col4, y, { width: pageW * 0.12 });
-      // checkbox
       doc.rect(col5 + 6, y + 2, 10, 10).stroke();
       doc.moveDown(0.0);
       doc.y = y + rowH;
