@@ -788,6 +788,7 @@ router.get("/children", requireAuth, async (req, res) => {
 // row with anthropometry captured during the in-depth assessment and exposes
 // sachets dispensed per visit.
 // -----------------------------------------------------------------------------
+
 router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
   try {
     const childId = String(req.params.childId);
@@ -804,6 +805,7 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
     });
 
     if (!child) return res.status(404).json({ message: "Child not found" });
+
     if (
       scope.mode !== "ALL" &&
       !scope.facilityIdsFacilitiesOnly.includes(String(child.facilityId))
@@ -813,8 +815,14 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
 
     const toNumberOrNull = (value) => {
       if (value === null || value === undefined || value === "") return null;
-      const n = typeof value === "number" ? value : Number(String(value).trim());
+      const n =
+        typeof value === "number" ? value : Number(String(value).trim());
       return Number.isFinite(n) ? n : null;
+    };
+
+    const round2 = (value) => {
+      const n = toNumberOrNull(value);
+      return n === null ? null : Number(n.toFixed(2));
     };
 
     const dateKey = (value) => {
@@ -822,6 +830,14 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       const d = new Date(value);
       if (Number.isNaN(d.getTime())) return null;
       return d.toISOString().slice(0, 10);
+    };
+
+    const toDay = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      d.setHours(0, 0, 0, 0);
+      return d;
     };
 
     const firstFinite = (...values) => {
@@ -841,6 +857,7 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
 
     const pickFromData = (data, keys) => {
       if (!data || typeof data !== "object") return null;
+
       for (const key of keys) {
         const direct = toNumberOrNull(data?.[key]);
         if (direct !== null) return direct;
@@ -866,7 +883,10 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
     };
 
     const sumDispenses = (dispenses) =>
-      (dispenses || []).reduce((sum, item) => sum + (Number(item?.quantitySachets) || 0), 0);
+      (dispenses || []).reduce(
+        (sum, item) => sum + (Number(item?.quantitySachets) || 0),
+        0
+      );
 
     const [visitsRaw, assessments] = await Promise.all([
       prisma.childVisit.findMany({
@@ -903,43 +923,95 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       }),
     ]);
 
-    const visits = visitsRaw.map((visit) => ({
-      id: visit.id,
-      visitDate: visit.visitDate,
-      weightKg: visit.weightKg,
-      heightCm: visit.heightCm,
-      muacMm: visit.muacMm,
-      whzScore: visit.whzScore,
-      nextAppointmentDate: visit.nextAppointmentDate,
-      sachetsDispensed: sumDispenses(visit.dispenses),
-    }));
+    const today = toDay(new Date());
+
+    const visits = visitsRaw.map((visit, index, arr) => {
+      let appointmentStatus = null;
+
+      if (visit.nextAppointmentDate) {
+        const dueDate = toDay(visit.nextAppointmentDate);
+        const nextVisit = arr.slice(index + 1).find((item) => item.visitDate);
+        const nextVisitDate = nextVisit?.visitDate ? toDay(nextVisit.visitDate) : null;
+
+        if (nextVisitDate && dueDate) {
+          appointmentStatus = nextVisitDate <= dueDate ? "HONOURED" : "MISSED";
+        } else if (dueDate && today && dueDate >= today) {
+          appointmentStatus = "UPCOMING";
+        } else {
+          appointmentStatus = "MISSED";
+        }
+      }
+
+      return {
+        id: visit.id,
+        visitDate: visit.visitDate,
+        weightKg: visit.weightKg,
+        heightCm: visit.heightCm,
+        muacMm: visit.muacMm,
+        whzScore: round2(visit.whzScore),
+        nextAppointmentDate: visit.nextAppointmentDate,
+        sachetsDispensed: sumDispenses(visit.dispenses),
+        appointmentStatus,
+      };
+    });
 
     const enrollmentAssessment =
-      assessments.find((assessment) => assessment.assessmentType === "ENROLLMENT") ||
+      assessments.find(
+        (assessment) => assessment.assessmentType === "ENROLLMENT"
+      ) ||
       assessments[0] ||
       null;
 
     if (enrollmentAssessment) {
       const enrollmentDateKey =
-        dateKey(enrollmentAssessment.assessmentDate) || dateKey(child.enrollmentDate);
+        dateKey(enrollmentAssessment.assessmentDate) ||
+        dateKey(child.enrollmentDate);
 
       const assessmentWeight = firstFinite(
         enrollmentAssessment.weightKg,
-        pickFromData(enrollmentAssessment.data, ["weightKg", "weight", "childWeightKg", "baselineWeightKg"])
-      );
-      const assessmentHeight = firstFinite(
-        enrollmentAssessment.heightCm,
-        pickFromData(enrollmentAssessment.data, ["heightCm", "height", "lengthCm", "childHeightCm", "baselineHeightCm"])
-      );
-      const assessmentMuac = firstFinite(
-        enrollmentAssessment.muacMm,
-        pickFromData(enrollmentAssessment.data, ["muacMm", "muac", "muacMM", "baselineMuacMm"])
-      );
-      const assessmentWhz = firstFinite(
-        pickFromData(enrollmentAssessment.data, ["whzScore", "whz", "zScore", "weightForHeightZScore"])
+        pickFromData(enrollmentAssessment.data, [
+          "weightKg",
+          "weight",
+          "childWeightKg",
+          "baselineWeightKg",
+        ])
       );
 
-      const matchingVisitIndex = visits.findIndex((visit) => dateKey(visit.visitDate) === enrollmentDateKey);
+      const assessmentHeight = firstFinite(
+        enrollmentAssessment.heightCm,
+        pickFromData(enrollmentAssessment.data, [
+          "heightCm",
+          "height",
+          "lengthCm",
+          "childHeightCm",
+          "baselineHeightCm",
+        ])
+      );
+
+      const assessmentMuac = firstFinite(
+        enrollmentAssessment.muacMm,
+        pickFromData(enrollmentAssessment.data, [
+          "muacMm",
+          "muac",
+          "muacMM",
+          "baselineMuacMm",
+        ])
+      );
+
+      const assessmentWhz = round2(
+        firstFinite(
+          pickFromData(enrollmentAssessment.data, [
+            "whzScore",
+            "whz",
+            "zScore",
+            "weightForHeightZScore",
+          ])
+        )
+      );
+
+      const matchingVisitIndex = visits.findIndex(
+        (visit) => dateKey(visit.visitDate) === enrollmentDateKey
+      );
 
       if (matchingVisitIndex >= 0) {
         const existing = visits[matchingVisitIndex];
@@ -960,11 +1032,44 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
           whzScore: assessmentWhz,
           nextAppointmentDate: null,
           sachetsDispensed: 0,
+          appointmentStatus: null,
         });
       }
     }
 
-    return res.json({ child, visits, assessments });
+    const latestScheduledVisit =
+      [...visits]
+        .filter((visit) => visit.nextAppointmentDate)
+        .sort((a, b) => {
+          const aDate = new Date(a.visitDate || a.nextAppointmentDate);
+          const bDate = new Date(b.visitDate || b.nextAppointmentDate);
+          return bDate - aDate;
+        })[0] || null;
+
+    let appointmentStatus = {
+      status: "NO_APPOINTMENT",
+      nextAppointmentDate: null,
+      daysOverdue: 0,
+    };
+
+    if (latestScheduledVisit?.nextAppointmentDate) {
+      const dueDate = toDay(latestScheduledVisit.nextAppointmentDate);
+      let daysOverdue = 0;
+
+      if (dueDate && today && dueDate < today) {
+        daysOverdue = Math.floor(
+          (today.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24)
+        );
+      }
+
+      appointmentStatus = {
+        status: latestScheduledVisit.appointmentStatus || "UPCOMING",
+        nextAppointmentDate: latestScheduledVisit.nextAppointmentDate,
+        daysOverdue,
+      };
+    }
+
+    return res.json({ child, visits, assessments, appointmentStatus });
   } catch (err) {
     console.error(err);
     return res
@@ -972,5 +1077,185 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       .json({ message: "Server error", error: String(err.message || err) });
   }
 });
+// -----------------------------------------------------------------------------
+// GET /api/dashboard/reports/missed-appointments
+// Query: fromDate=YYYY-MM-DD, toDate=YYYY-MM-DD, take, skip
+// Counts missed appointments and returns the missed appointment rows.
+// -----------------------------------------------------------------------------
+router.get("/reports/missed-appointments", requireAuth, async (req, res) => {
+  try {
+    const take = Math.min(200, Math.max(1, toInt(req.query.take, 10)));
+    const skip = Math.max(0, toInt(req.query.skip, 0));
+    const fromDateRaw = req.query.fromDate ? String(req.query.fromDate) : null;
+    const toDateRaw = req.query.toDate ? String(req.query.toDate) : null;
 
+    const scope = await getScope(req);
+
+    const parseDateStart = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      d.setHours(0, 0, 0, 0);
+      return d;
+    };
+
+    const parseDateEnd = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      d.setHours(23, 59, 59, 999);
+      return d;
+    };
+
+    const fromDate = parseDateStart(fromDateRaw);
+    const toDate = parseDateEnd(toDateRaw);
+
+    const where = {
+      nextAppointmentDate: {
+        not: null,
+        ...(fromDate ? { gte: fromDate } : {}),
+        ...(toDate ? { lte: toDate } : {}),
+      },
+      facilityId:
+        scope.mode === "ALL"
+          ? undefined
+          : { in: scope.facilityIdsFacilitiesOnly },
+    };
+
+    const appointmentRows = await prisma.childVisit.findMany({
+      where,
+      orderBy: [{ nextAppointmentDate: "desc" }, { visitDate: "asc" }],
+      select: {
+        id: true,
+        childId: true,
+        facilityId: true,
+        visitDate: true,
+        nextAppointmentDate: true,
+        child: {
+          select: {
+            id: true,
+            uniqueChildNumber: true,
+            facility: {
+              select: { id: true, code: true, name: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!appointmentRows.length) {
+      return res.json({
+        summary: { missedAppointments: 0 },
+        total: 0,
+        take,
+        skip,
+        rows: [],
+        filters: {
+          fromDate: fromDateRaw,
+          toDate: toDateRaw,
+        },
+      });
+    }
+
+    const childIds = [...new Set(appointmentRows.map((r) => r.childId))];
+
+    const allVisits = await prisma.childVisit.findMany({
+      where: { childId: { in: childIds } },
+      orderBy: [{ childId: "asc" }, { visitDate: "asc" }],
+      select: {
+        id: true,
+        childId: true,
+        visitDate: true,
+      },
+    });
+
+    const visitsByChild = new Map();
+    for (const visit of allVisits) {
+      if (!visitsByChild.has(visit.childId)) {
+        visitsByChild.set(visit.childId, []);
+      }
+      visitsByChild.get(visit.childId).push(visit);
+    }
+
+    const today = startOfDay(new Date());
+    const msPerDay = 1000 * 60 * 60 * 24;
+
+    const missedRows = [];
+
+    for (const row of appointmentRows) {
+      const dueDate = row.nextAppointmentDate
+        ? startOfDay(row.nextAppointmentDate)
+        : null;
+
+      if (!dueDate) continue;
+
+      const childVisits = visitsByChild.get(row.childId) || [];
+      const currentVisitTime = row.visitDate ? new Date(row.visitDate).getTime() : null;
+
+      const nextVisit = childVisits.find((visit) => {
+        if (!visit.visitDate) return false;
+        const visitTime = new Date(visit.visitDate).getTime();
+
+        if (currentVisitTime === null) {
+          return visit.id !== row.id;
+        }
+
+        return visitTime > currentVisitTime;
+      });
+
+      const nextVisitDate = nextVisit?.visitDate ? startOfDay(nextVisit.visitDate) : null;
+
+      let status = "UPCOMING";
+
+      if (nextVisitDate) {
+        status = nextVisitDate <= dueDate ? "HONOURED" : "MISSED";
+      } else if (dueDate < today) {
+        status = "MISSED";
+      }
+
+      if (status === "MISSED") {
+        const lateUntil = nextVisitDate || today;
+        const daysLate = Math.max(
+          0,
+          Math.floor((lateUntil.getTime() - dueDate.getTime()) / msPerDay)
+        );
+
+        missedRows.push({
+          appointmentId: row.id,
+          childId: row.childId,
+          uniqueChildNumber: row.child?.uniqueChildNumber || null,
+          facility: row.child?.facility || null,
+          appointmentDate: row.nextAppointmentDate,
+          nextVisitDate: nextVisit?.visitDate || null,
+          daysLate,
+          status: "MISSED",
+        });
+      }
+    }
+
+    missedRows.sort(
+      (a, b) => new Date(b.appointmentDate).getTime() - new Date(a.appointmentDate).getTime()
+    );
+
+    const total = missedRows.length;
+    const rows = missedRows.slice(skip, skip + take);
+
+    return res.json({
+      summary: { missedAppointments: total },
+      total,
+      take,
+      skip,
+      rows,
+      filters: {
+        fromDate: fromDateRaw,
+        toDate: toDateRaw,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ message: "Server error", error: String(err.message || err) });
+  }
+});
 module.exports = router;
