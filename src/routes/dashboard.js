@@ -1258,4 +1258,4 @@ router.get("/reports/missed-appointments", requireAuth, async (req, res) => {
       .json({ message: "Server error", error: String(err.message || err) });
   }
 });
-module.exports = router;
+module.exports = router; 

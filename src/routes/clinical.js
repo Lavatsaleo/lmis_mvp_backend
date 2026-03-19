@@ -29,6 +29,37 @@ function parseDateOrNull(value) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+
+function startOfDay(value) {
+  const d = new Date(value);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function endOfDay(value) {
+  const d = new Date(value);
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+
+function normalizeDateOnly(value) {
+  const d = parseDateOrNull(value);
+  if (!d) return null;
+  return startOfDay(d);
+}
+
+function formatDateOnly(value) {
+  const d = new Date(value);
+  const y = d.getFullYear().toString().padStart(4, "0");
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function compareDescByDate(a, b) {
+  return new Date(b).getTime() - new Date(a).getTime();
+}
+
 function normalizeAssessmentType(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return null;
@@ -497,6 +528,75 @@ async function assertChildInMyFacility(req, childId) {
   return child;
 }
 
+
+async function buildChildSummaryForFacility(childId) {
+  const child = await prisma.child.findUnique({
+    where: { id: childId },
+    include: {
+      caregiver: true,
+      inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
+      visits: {
+        orderBy: { visitDate: "desc" },
+        include: {
+          dispenses: {
+            orderBy: { createdAt: "desc" },
+            include: { box: true },
+          },
+        },
+      },
+    },
+  });
+
+  if (!child) return null;
+
+  const enrollmentAssessment =
+    (child.inDepthAssessments || []).find((a) => a.assessmentType === "ENROLLMENT") || null;
+
+  const visits = (child.visits || []).map((v) => {
+    const dispenses = (v.dispenses || []).map((d) => addLegacyDispenseFields(d, v, child));
+    const enrichedVisit = enrichVisitFromAssessmentIfNeeded({ ...v, dispenses }, enrollmentAssessment);
+    return addLegacyVisitFields(enrichedVisit);
+  });
+
+  if (enrollmentAssessment) {
+    const alreadyRepresented = visits.some((v) => sameDay(v.visitDate, enrollmentAssessment.assessmentDate));
+
+    if (!alreadyRepresented) {
+      visits.push(
+        addLegacyVisitFields({
+          id: `assessment-${enrollmentAssessment.id}`,
+          childId: child.id,
+          facilityId: child.facilityId,
+          performedByUserId: enrollmentAssessment.performedByUserId,
+          visitDate: enrollmentAssessment.assessmentDate,
+          notes: "Enrollment assessment",
+          nextAppointmentDate: null,
+          dispenses: [],
+          source: "ENROLLMENT_ASSESSMENT",
+          ...extractAssessmentVisitMetrics(enrollmentAssessment.data),
+          createdAt: enrollmentAssessment.createdAt,
+        })
+      );
+    }
+
+    visits.sort((a, b) => new Date(b.visitDate).getTime() - new Date(a.visitDate).getTime());
+  }
+
+  const assessments = (child.inDepthAssessments || []).map((a) => addLegacyAssessmentFields(a));
+
+  return addLegacyChildFields({
+    ...child,
+    caregiver: addLegacyCaregiverFields(child.caregiver),
+    inDepthAssessment: enrollmentAssessment ? addLegacyAssessmentFields(enrollmentAssessment) : null,
+    inDepthAssessments: assessments,
+    visits,
+  });
+}
+
+function deriveLatestAppointmentVisit(visits) {
+  return (visits || []).find((v) => v && v.nextAppointmentDate);
+}
+
 // ---------------- routes ----------------
 
 /**
@@ -822,6 +922,229 @@ router.get(
   }
 );
 
+
+/**
+ * 2b) Facility appointments diary (shared facility calendar)
+ * GET /api/clinical/facility/appointments?date=YYYY-MM-DD
+ */
+router.get(
+  "/facility/appointments",
+  requireAuth,
+  requireRole("SUPER_ADMIN", "CLINICIAN", "FACILITY_OFFICER", "VIEWER"),
+  async (req, res) => {
+    try {
+      const facility = await resolveFacilityForClinical(req, req.query || {});
+      if (!facility) {
+        return res.status(400).json({ message: "Your user has no facility assigned" });
+      }
+
+      const target = normalizeDateOnly(req.query.date || new Date());
+      if (!target) {
+        return res.status(400).json({ message: "date must be a valid date (YYYY-MM-DD)" });
+      }
+
+      const children = await prisma.child.findMany({
+        where: { facilityId: facility.id },
+        include: {
+          caregiver: true,
+          inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
+          visits: {
+            orderBy: { visitDate: "desc" },
+            include: {
+              dispenses: {
+                orderBy: { createdAt: "desc" },
+                include: { box: true },
+              },
+            },
+          },
+        },
+        orderBy: { updatedAt: "desc" },
+        take: 1000,
+      });
+
+      const today = startOfDay(new Date());
+      const rows = [];
+
+      for (const child of children) {
+        const enrollmentAssessment =
+          (child.inDepthAssessments || []).find((a) => a.assessmentType === "ENROLLMENT") || null;
+
+        const visits = (child.visits || []).map((v) => {
+          const dispenses = (v.dispenses || []).map((d) => addLegacyDispenseFields(d, v, child));
+          const enrichedVisit = enrichVisitFromAssessmentIfNeeded({ ...v, dispenses }, enrollmentAssessment);
+          return addLegacyVisitFields(enrichedVisit);
+        });
+
+        const latestAppointmentVisit = deriveLatestAppointmentVisit(visits);
+        if (!latestAppointmentVisit || !sameDay(latestAppointmentVisit.nextAppointmentDate, target)) {
+          continue;
+        }
+
+        const seen = (child.visits || []).some((v) => sameDay(v.visitDate, target));
+        const status = seen
+          ? "HONOURED"
+          : target.getTime() <= today.getTime()
+            ? "MISSED"
+            : "UPCOMING";
+
+        rows.push({
+          appointmentDate: formatDateOnly(target),
+          status,
+          seen,
+          child: {
+            id: child.id,
+            uniqueChildNumber: child.uniqueChildNumber,
+            firstName: child.firstName,
+            lastName: child.lastName,
+            sex: child.sex,
+            dateOfBirth: child.dateOfBirth,
+            cwcNumber: child.cwcNumber,
+            enrollmentDate: child.enrollmentDate,
+            caregiver: addLegacyCaregiverFields(child.caregiver),
+          },
+          latestVisit: latestAppointmentVisit
+            ? {
+                id: latestAppointmentVisit.id,
+                visitDate: latestAppointmentVisit.visitDate,
+                nextAppointmentDate: latestAppointmentVisit.nextAppointmentDate,
+                notes: latestAppointmentVisit.notes,
+                sachetsDispensed: sumVisitSachets(latestAppointmentVisit),
+              }
+            : null,
+        });
+      }
+
+      rows.sort((a, b) => {
+        if (a.seen !== b.seen) return a.seen ? 1 : -1;
+        const an = `${a.child.firstName} ${a.child.lastName}`.toLowerCase();
+        const bn = `${b.child.firstName} ${b.child.lastName}`.toLowerCase();
+        return an.localeCompare(bn);
+      });
+
+      return res.json({
+        facility: { id: facility.id, code: facility.code, name: facility.name },
+        date: formatDateOnly(target),
+        count: rows.length,
+        rows,
+      });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+    }
+  }
+);
+
+/**
+ * 2c) Recent child activity for my facility
+ * GET /api/clinical/facility/children/recent?date=YYYY-MM-DD&take=50
+ */
+router.get(
+  "/facility/children/recent",
+  requireAuth,
+  requireRole("SUPER_ADMIN", "CLINICIAN", "FACILITY_OFFICER", "VIEWER"),
+  async (req, res) => {
+    try {
+      const facility = await resolveFacilityForClinical(req, req.query || {});
+      if (!facility) {
+        return res.status(400).json({ message: "Your user has no facility assigned" });
+      }
+
+      const takeRaw = Number(req.query.take || 50);
+      const take = Number.isFinite(takeRaw) ? Math.max(1, Math.min(200, Math.round(takeRaw))) : 50;
+
+      const target = req.query.date ? normalizeDateOnly(req.query.date) : null;
+      if (req.query.date && !target) {
+        return res.status(400).json({ message: "date must be a valid date (YYYY-MM-DD)" });
+      }
+
+      const children = await prisma.child.findMany({
+        where: { facilityId: facility.id },
+        include: {
+          caregiver: true,
+          visits: {
+            orderBy: { visitDate: "desc" },
+            include: { dispenses: { orderBy: { createdAt: "desc" } } },
+          },
+          inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
+        },
+        orderBy: { updatedAt: "desc" },
+        take: 1000,
+      });
+
+      const rows = [];
+
+      for (const child of children) {
+        const actualVisits = child.visits || [];
+        const assessments = child.inDepthAssessments || [];
+
+        const matchingVisit = target
+          ? actualVisits.find((v) => sameDay(v.visitDate, target))
+          : actualVisits[0] || null;
+
+        const matchingAssessment = target
+          ? assessments.find((a) => sameDay(a.assessmentDate, target))
+          : assessments[0] || null;
+
+        const isEnrollmentToday = target ? sameDay(child.enrollmentDate, target) : false;
+
+        if (target && !matchingVisit && !matchingAssessment && !isEnrollmentToday) {
+          continue;
+        }
+
+        const activityDate =
+          matchingVisit?.visitDate ||
+          matchingAssessment?.assessmentDate ||
+          child.enrollmentDate ||
+          child.createdAt;
+
+        const latestAppointmentVisit = deriveLatestAppointmentVisit(actualVisits.map((v) => addLegacyVisitFields(v)));
+
+        rows.push({
+          activityDate,
+          child: {
+            id: child.id,
+            uniqueChildNumber: child.uniqueChildNumber,
+            firstName: child.firstName,
+            lastName: child.lastName,
+            sex: child.sex,
+            dateOfBirth: child.dateOfBirth,
+            cwcNumber: child.cwcNumber,
+            enrollmentDate: child.enrollmentDate,
+            caregiver: addLegacyCaregiverFields(child.caregiver),
+          },
+          visit: matchingVisit
+            ? {
+                id: matchingVisit.id,
+                visitDate: matchingVisit.visitDate,
+                notes: matchingVisit.notes,
+                nextAppointmentDate: matchingVisit.nextAppointmentDate,
+                sachetsDispensed: (matchingVisit.dispenses || []).reduce(
+                  (sum, d) => sum + Math.round(Number(d?.quantitySachets || 0)),
+                  0
+                ),
+              }
+            : null,
+          latestAppointmentDate: latestAppointmentVisit?.nextAppointmentDate || null,
+          hasAssessment: !!matchingAssessment,
+          enrolledToday: isEnrollmentToday,
+        });
+      }
+
+      rows.sort((a, b) => compareDescByDate(a.activityDate, b.activityDate));
+
+      return res.json({
+        facility: { id: facility.id, code: facility.code, name: facility.name },
+        date: target ? formatDateOnly(target) : null,
+        count: rows.length > take ? take : rows.length,
+        rows: rows.slice(0, take),
+      });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+    }
+  }
+);
+
 /**
  * 3) Child summary
  * GET /api/clinical/children/:childId/summary
@@ -836,71 +1159,12 @@ router.get(
       if (!childCheck) return res.status(404).json({ message: "Child not found" });
       if (childCheck === "FORBIDDEN") return res.status(403).json({ message: "Forbidden" });
 
-      const child = await prisma.child.findUnique({
-        where: { id: req.params.childId },
-        include: {
-          caregiver: true,
-          inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
-          visits: {
-            orderBy: { visitDate: "desc" },
-            include: {
-              dispenses: {
-                orderBy: { createdAt: "desc" },
-                include: { box: true },
-              },
-            },
-          },
-        },
-      });
-
-      const enrollmentAssessment =
-        (child.inDepthAssessments || []).find((a) => a.assessmentType === "ENROLLMENT") || null;
-
-      const visits = (child.visits || []).map((v) => {
-        const dispenses = (v.dispenses || []).map((d) => addLegacyDispenseFields(d, v, child));
-        const enrichedVisit = enrichVisitFromAssessmentIfNeeded({ ...v, dispenses }, enrollmentAssessment);
-        return addLegacyVisitFields(enrichedVisit);
-      });
-
-      if (enrollmentAssessment) {
-        const alreadyRepresented = visits.some((v) => sameDay(v.visitDate, enrollmentAssessment.assessmentDate));
-
-        if (!alreadyRepresented) {
-          visits.push(
-            addLegacyVisitFields({
-              id: `assessment-${enrollmentAssessment.id}`,
-              childId: child.id,
-              facilityId: child.facilityId,
-              performedByUserId: enrollmentAssessment.performedByUserId,
-              visitDate: enrollmentAssessment.assessmentDate,
-              notes: "Enrollment assessment",
-              nextAppointmentDate: null,
-              dispenses: [],
-              source: "ENROLLMENT_ASSESSMENT",
-              ...extractAssessmentVisitMetrics(enrollmentAssessment.data),
-              createdAt: enrollmentAssessment.createdAt,
-            })
-          );
-        }
-
-        visits.sort((a, b) => new Date(b.visitDate).getTime() - new Date(a.visitDate).getTime());
-      }
-
-      const assessments = (child.inDepthAssessments || []).map((a) => addLegacyAssessmentFields(a));
-
-      const outChild = addLegacyChildFields({
-        ...child,
-        caregiver: addLegacyCaregiverFields(child.caregiver),
-        // Legacy field (older UI): enrollment assessment
-        inDepthAssessment: enrollmentAssessment ? addLegacyAssessmentFields(enrollmentAssessment) : null,
-        // New field: all assessments
-        inDepthAssessments: assessments,
-        visits,
-      });
+      const outChild = await buildChildSummaryForFacility(req.params.childId);
+      if (!outChild) return res.status(404).json({ message: "Child not found" });
 
       return res.json({
         ...outChild,
-        ageInMonths: computeAgeInMonths(child.dateOfBirth),
+        ageInMonths: computeAgeInMonths(outChild.dateOfBirth),
       });
     } catch (err) {
       console.error(err);
