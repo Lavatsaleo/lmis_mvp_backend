@@ -788,7 +788,6 @@ router.get("/children", requireAuth, async (req, res) => {
 // row with anthropometry captured during the in-depth assessment and exposes
 // sachets dispensed per visit.
 // -----------------------------------------------------------------------------
-
 router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
   try {
     const childId = String(req.params.childId);
@@ -832,12 +831,32 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       return d.toISOString().slice(0, 10);
     };
 
-    const toDay = (value) => {
+    const kenyaDateKey = (value) => {
       if (!value) return null;
       const d = new Date(value);
       if (Number.isNaN(d.getTime())) return null;
-      d.setHours(0, 0, 0, 0);
-      return d;
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Africa/Nairobi",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(d);
+
+      const year = parts.find((p) => p.type === "year")?.value;
+      const month = parts.find((p) => p.type === "month")?.value;
+      const day = parts.find((p) => p.type === "day")?.value;
+
+      return `${year}-${month}-${day}`;
+    };
+
+    const daysBetweenDateKeys = (fromKey, toKey) => {
+      if (!fromKey || !toKey) return 0;
+      const from = new Date(`${fromKey}T00:00:00Z`);
+      const to = new Date(`${toKey}T00:00:00Z`);
+      return Math.max(
+        0,
+        Math.floor((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24))
+      );
     };
 
     const firstFinite = (...values) => {
@@ -923,21 +942,23 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       }),
     ]);
 
-    const today = toDay(new Date());
+    const todayKey = kenyaDateKey(new Date());
 
     const visits = visitsRaw.map((visit, index, arr) => {
       let appointmentStatus = null;
 
       if (visit.nextAppointmentDate) {
-        const dueDate = toDay(visit.nextAppointmentDate);
+        const dueKey = kenyaDateKey(visit.nextAppointmentDate);
         const nextVisit = arr.slice(index + 1).find((item) => item.visitDate);
-        const nextVisitDate = nextVisit?.visitDate ? toDay(nextVisit.visitDate) : null;
+        const nextVisitKey = nextVisit?.visitDate
+          ? kenyaDateKey(nextVisit.visitDate)
+          : null;
 
-        if (nextVisitDate && dueDate) {
-          appointmentStatus = nextVisitDate <= dueDate ? "HONOURED" : "MISSED";
-        } else if (dueDate && today && dueDate >= today) {
+        if (nextVisitKey && dueKey) {
+          appointmentStatus = nextVisitKey <= dueKey ? "HONOURED" : "MISSED";
+        } else if (dueKey && todayKey && dueKey > todayKey) {
           appointmentStatus = "UPCOMING";
-        } else {
+        } else if (dueKey && todayKey && dueKey <= todayKey) {
           appointmentStatus = "MISSED";
         }
       }
@@ -1053,14 +1074,11 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
     };
 
     if (latestScheduledVisit?.nextAppointmentDate) {
-      const dueDate = toDay(latestScheduledVisit.nextAppointmentDate);
-      let daysOverdue = 0;
-
-      if (dueDate && today && dueDate < today) {
-        daysOverdue = Math.floor(
-          (today.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24)
-        );
-      }
+      const dueKey = kenyaDateKey(latestScheduledVisit.nextAppointmentDate);
+      const daysOverdue =
+        latestScheduledVisit.appointmentStatus === "MISSED"
+          ? daysBetweenDateKeys(dueKey, todayKey)
+          : 0;
 
       appointmentStatus = {
         status: latestScheduledVisit.appointmentStatus || "UPCOMING",
