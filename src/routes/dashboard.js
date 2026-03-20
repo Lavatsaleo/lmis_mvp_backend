@@ -1276,4 +1276,175 @@ router.get("/reports/missed-appointments", requireAuth, async (req, res) => {
       .json({ message: "Server error", error: String(err.message || err) });
   }
 });
+// -----------------------------------------------------------------------------
+// GET /api/dashboard/reports/honoured-follow-ups
+// Query: fromDate=YYYY-MM-DD, toDate=YYYY-MM-DD, take, skip
+// Counts honoured follow up visits and returns the honoured rows.
+// -----------------------------------------------------------------------------
+router.get("/reports/honoured-follow-ups", requireAuth, async (req, res) => {
+  try {
+    const take = Math.min(200, Math.max(1, toInt(req.query.take, 10)));
+    const skip = Math.max(0, toInt(req.query.skip, 0));
+    const fromDateRaw = req.query.fromDate ? String(req.query.fromDate) : null;
+    const toDateRaw = req.query.toDate ? String(req.query.toDate) : null;
+
+    const scope = await getScope(req);
+
+    const parseDateStart = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      d.setHours(0, 0, 0, 0);
+      return d;
+    };
+
+    const parseDateEnd = (value) => {
+      if (!value) return null;
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      d.setHours(23, 59, 59, 999);
+      return d;
+    };
+
+    const fromDate = parseDateStart(fromDateRaw);
+    const toDate = parseDateEnd(toDateRaw);
+    const msPerDay = 1000 * 60 * 60 * 24;
+
+    const where = {
+      nextAppointmentDate: {
+        not: null,
+        ...(fromDate ? { gte: fromDate } : {}),
+        ...(toDate ? { lte: toDate } : {}),
+      },
+      facilityId:
+        scope.mode === "ALL"
+          ? undefined
+          : { in: scope.facilityIdsFacilitiesOnly },
+    };
+
+    const appointmentRows = await prisma.childVisit.findMany({
+      where,
+      orderBy: [{ nextAppointmentDate: "desc" }, { visitDate: "asc" }],
+      select: {
+        id: true,
+        childId: true,
+        facilityId: true,
+        visitDate: true,
+        nextAppointmentDate: true,
+        child: {
+          select: {
+            id: true,
+            uniqueChildNumber: true,
+            facility: {
+              select: { id: true, code: true, name: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!appointmentRows.length) {
+      return res.json({
+        summary: { honouredFollowUps: 0 },
+        total: 0,
+        take,
+        skip,
+        rows: [],
+        filters: {
+          fromDate: fromDateRaw,
+          toDate: toDateRaw,
+        },
+      });
+    }
+
+    const childIds = [...new Set(appointmentRows.map((r) => r.childId))];
+
+    const allVisits = await prisma.childVisit.findMany({
+      where: { childId: { in: childIds } },
+      orderBy: [{ childId: "asc" }, { visitDate: "asc" }],
+      select: {
+        id: true,
+        childId: true,
+        visitDate: true,
+      },
+    });
+
+    const visitsByChild = new Map();
+    for (const visit of allVisits) {
+      if (!visitsByChild.has(visit.childId)) {
+        visitsByChild.set(visit.childId, []);
+      }
+      visitsByChild.get(visit.childId).push(visit);
+    }
+
+    const honouredRows = [];
+
+    for (const row of appointmentRows) {
+      const dueDate = row.nextAppointmentDate
+        ? startOfDay(row.nextAppointmentDate)
+        : null;
+
+      if (!dueDate) continue;
+
+      const childVisits = visitsByChild.get(row.childId) || [];
+      const currentVisitTime = row.visitDate ? new Date(row.visitDate).getTime() : null;
+
+      const nextVisit = childVisits.find((visit) => {
+        if (!visit.visitDate) return false;
+        const visitTime = new Date(visit.visitDate).getTime();
+
+        if (currentVisitTime === null) {
+          return visit.id !== row.id;
+        }
+
+        return visitTime > currentVisitTime;
+      });
+
+      const nextVisitDate = nextVisit?.visitDate ? startOfDay(nextVisit.visitDate) : null;
+
+      if (nextVisitDate && nextVisitDate <= dueDate) {
+        const daysEarly = Math.max(
+          0,
+          Math.floor((dueDate.getTime() - nextVisitDate.getTime()) / msPerDay)
+        );
+
+        honouredRows.push({
+          appointmentId: row.id,
+          childId: row.childId,
+          uniqueChildNumber: row.child?.uniqueChildNumber || null,
+          facility: row.child?.facility || null,
+          appointmentDate: row.nextAppointmentDate,
+          nextVisitDate: nextVisit?.visitDate || null,
+          daysEarly,
+          status: "HONOURED",
+        });
+      }
+    }
+
+    honouredRows.sort(
+      (a, b) => new Date(b.appointmentDate).getTime() - new Date(a.appointmentDate).getTime()
+    );
+
+    const total = honouredRows.length;
+    const rows = honouredRows.slice(skip, skip + take);
+
+    return res.json({
+      summary: { honouredFollowUps: total },
+      total,
+      take,
+      skip,
+      rows,
+      filters: {
+        fromDate: fromDateRaw,
+        toDate: toDateRaw,
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
 module.exports = router; 
