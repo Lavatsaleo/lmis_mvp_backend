@@ -101,13 +101,26 @@ router.get("/overview", requireAuth, async (req, res) => {
       toInt(req.query.stockoutThresholdDays, 14)
     );
     const expiryWarnDays = Math.max(1, toInt(req.query.expiryWarnDays, 60));
+    const requestedFacilityId = req.query.facilityId
+      ? String(req.query.facilityId)
+      : null;
 
     const scope = await getScope(req);
     const today = startOfDay(new Date());
     const warnDate = new Date(today);
     warnDate.setDate(warnDate.getDate() + expiryWarnDays);
 
-    // ---- Warehouse stock (only meaningful for ALL or WAREHOUSE scope) ----
+    let selectedFacilityId = null;
+    if (requestedFacilityId) {
+      if (
+        scope.mode !== "ALL" &&
+        !scope.facilityIdsFacilitiesOnly.includes(requestedFacilityId)
+      ) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      selectedFacilityId = requestedFacilityId;
+    }
+
     let boxesInWarehouse = 0;
     if (scope.mode === "ALL") {
       boxesInWarehouse = await prisma.box.count({
@@ -119,14 +132,14 @@ router.get("/overview", requireAuth, async (req, res) => {
       });
     }
 
-    // ---- Facility stock ----
-    const facilityBoxWhere =
-      scope.mode === "ALL"
-        ? { status: "IN_FACILITY" }
-        : {
-            status: "IN_FACILITY",
-            currentFacilityId: { in: scope.facilityIdsFacilitiesOnly },
-          };
+    const facilityBoxWhere = {
+      status: "IN_FACILITY",
+      currentFacilityId: selectedFacilityId
+        ? selectedFacilityId
+        : scope.mode === "ALL"
+        ? undefined
+        : { in: scope.facilityIdsFacilitiesOnly },
+    };
 
     const boxesInFacilities = await prisma.box.count({ where: facilityBoxWhere });
     const sachetsInFacilitiesAgg = await prisma.box.aggregate({
@@ -134,8 +147,8 @@ router.get("/overview", requireAuth, async (req, res) => {
       _sum: { sachetsRemaining: true },
     });
     const sachetsInFacilities = sachetsInFacilitiesAgg._sum.sachetsRemaining || 0;
+    const sachetsInWarehouse = boxesInWarehouse * 600;
 
-    // Facility store summary (boxes + sachets per facility)
     const facilityAgg = await prisma.box.groupBy({
       by: ["currentFacilityId"],
       where: facilityBoxWhere,
@@ -168,21 +181,21 @@ router.get("/overview", requireAuth, async (req, res) => {
         (a.facilityName || "").localeCompare(b.facilityName || "")
       );
 
-    // ---- Transit (prefer Shipments) ----
     let boxesInTransit = 0;
     let transitTo = [];
 
-    const shipWhere =
-      scope.mode === "ALL"
-        ? { status: "DISPATCHED" }
-        : scope.mode === "WAREHOUSE"
-        ? { status: "DISPATCHED", fromWarehouseId: scope.warehouseId }
-        : scope.mode === "FACILITY"
-        ? {
-            status: "DISPATCHED",
-            toFacilityId: scope.facilityIdsFacilitiesOnly[0],
-          }
-        : { status: "DISPATCHED", id: "__none__" };
+    const shipWhere = selectedFacilityId
+      ? { status: "DISPATCHED", toFacilityId: selectedFacilityId }
+      : scope.mode === "ALL"
+      ? { status: "DISPATCHED" }
+      : scope.mode === "WAREHOUSE"
+      ? { status: "DISPATCHED", fromWarehouseId: scope.warehouseId }
+      : scope.mode === "FACILITY"
+      ? {
+          status: "DISPATCHED",
+          toFacilityId: scope.facilityIdsFacilitiesOnly[0],
+        }
+      : { status: "DISPATCHED", id: "__none__" };
 
     const activeShipments = await prisma.shipment.findMany({
       where: shipWhere,
@@ -210,16 +223,16 @@ router.get("/overview", requireAuth, async (req, res) => {
       waybillUrl: `/api/shipments/${s.id}/waybill.pdf`,
     }));
 
-    // ---- Expiring soon (warehouse + facility stock) ----
     const expWhereBase = {
       expiryDate: { lte: warnDate },
       status: { in: ["IN_WAREHOUSE", "IN_FACILITY"] },
     };
 
-    const expWhere =
-      scope.mode === "ALL"
-        ? expWhereBase
-        : { ...expWhereBase, currentFacilityId: { in: scope.facilityIdsAll } };
+    const expWhere = selectedFacilityId
+      ? { ...expWhereBase, currentFacilityId: selectedFacilityId }
+      : scope.mode === "ALL"
+      ? expWhereBase
+      : { ...expWhereBase, currentFacilityId: { in: scope.facilityIdsAll } };
 
     const expiringSoon = await prisma.box.findMany({
       where: expWhere,
@@ -239,15 +252,14 @@ router.get("/overview", requireAuth, async (req, res) => {
       },
     });
 
-    // ---- Children enrolled count ----
-    const childWhere =
-      scope.mode === "ALL"
-        ? {}
-        : { facilityId: { in: scope.facilityIdsFacilitiesOnly } };
+    const childWhere = selectedFacilityId
+      ? { facilityId: selectedFacilityId }
+      : scope.mode === "ALL"
+      ? {}
+      : { facilityId: { in: scope.facilityIdsFacilitiesOnly } };
 
     const childrenEnrolled = await prisma.child.count({ where: childWhere });
 
-    // ---- Stockout risk (days of stock) ----
     const windowStart = new Date(today);
     windowStart.setDate(windowStart.getDate() - days);
 
@@ -255,10 +267,11 @@ router.get("/overview", requireAuth, async (req, res) => {
       where: {
         createdAt: { gte: windowStart },
         boxId: { not: null },
-        visit:
-          scope.mode === "ALL"
-            ? undefined
-            : { facilityId: { in: scope.facilityIdsFacilitiesOnly } },
+        visit: selectedFacilityId
+          ? { facilityId: selectedFacilityId }
+          : scope.mode === "ALL"
+          ? undefined
+          : { facilityId: { in: scope.facilityIdsFacilitiesOnly } },
       },
       select: {
         quantitySachets: true,
@@ -268,8 +281,12 @@ router.get("/overview", requireAuth, async (req, res) => {
       take: 50000,
     });
 
-    // total dispensed per facility+product
-    const usageMap = new Map(); // key=facility__product => total
+    const sachetsDispensed = dispenses.reduce(
+      (sum, d) => sum + (Number(d.quantitySachets) || 0),
+      0
+    );
+
+    const usageMap = new Map();
     for (const d of dispenses) {
       const facilityId = d.visit?.facilityId;
       const productId = d.box?.productId;
@@ -278,20 +295,20 @@ router.get("/overview", requireAuth, async (req, res) => {
       usageMap.set(key, (usageMap.get(key) || 0) + (d.quantitySachets || 0));
     }
 
-    // current on-hand per facility+product (sachetsRemaining)
     const stockRows = await prisma.box.findMany({
       where: {
         status: "IN_FACILITY",
-        currentFacilityId:
-          scope.mode === "ALL"
-            ? undefined
-            : { in: scope.facilityIdsFacilitiesOnly },
+        currentFacilityId: selectedFacilityId
+          ? selectedFacilityId
+          : scope.mode === "ALL"
+          ? undefined
+          : { in: scope.facilityIdsFacilitiesOnly },
       },
       select: { sachetsRemaining: true, currentFacilityId: true, productId: true },
       take: 50000,
     });
 
-    const stockMap = new Map(); // key=facility__product => onhand
+    const stockMap = new Map();
     for (const r of stockRows) {
       const key = `${r.currentFacilityId}__${r.productId}`;
       stockMap.set(key, (stockMap.get(key) || 0) + (r.sachetsRemaining || 0));
@@ -344,13 +361,21 @@ router.get("/overview", requireAuth, async (req, res) => {
         boxesInTransit,
         boxesInFacilities,
         sachetsInFacilities,
+        sachetsInWarehouse,
+        sachetsDispensed,
         childrenEnrolled,
       },
       transitTo,
       facilityStore,
       expiringSoon,
       stockoutRisk,
-      meta: { scope: scope.mode, days, stockoutThresholdDays, expiryWarnDays },
+      meta: {
+        scope: scope.mode,
+        days,
+        stockoutThresholdDays,
+        expiryWarnDays,
+        selectedFacilityId,
+      },
     });
   } catch (err) {
     console.error(err);
