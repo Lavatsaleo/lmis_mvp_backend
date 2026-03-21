@@ -29,6 +29,39 @@ function parseDateOrNull(value) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+function normalizeDateOnly(value) {
+  const d = parseDateOrNull(value);
+  if (!d) return null;
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function startOfDay(value = new Date()) {
+  const d = parseDateOrNull(value) || new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function formatDateOnly(value) {
+  const d = normalizeDateOnly(value);
+  if (!d) return null;
+
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function compareDescByDate(a, b) {
+  const da = parseDateOrNull(a);
+  const db = parseDateOrNull(b);
+
+  const ta = da ? da.getTime() : 0;
+  const tb = db ? db.getTime() : 0;
+
+  return tb - ta;
+}
+
 function normalizeAssessmentType(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return null;
@@ -103,6 +136,25 @@ function addLegacyAssessmentFields(assessment) {
     // legacy alias
     assessedAt: assessment.assessmentDate,
   };
+}
+
+function deriveLatestAppointmentVisit(visits) {
+  if (!Array.isArray(visits) || visits.length === 0) return null;
+
+  const withAppointment = visits.filter((v) => parseDateOrNull(v?.nextAppointmentDate));
+  if (withAppointment.length === 0) return null;
+
+  withAppointment.sort((a, b) => {
+    const aAppt = parseDateOrNull(a?.nextAppointmentDate)?.getTime() || 0;
+    const bAppt = parseDateOrNull(b?.nextAppointmentDate)?.getTime() || 0;
+    if (bAppt !== aAppt) return bAppt - aAppt;
+
+    const aVisit = parseDateOrNull(a?.visitDate)?.getTime() || 0;
+    const bVisit = parseDateOrNull(b?.visitDate)?.getTime() || 0;
+    return bVisit - aVisit;
+  });
+
+  return withAppointment[0];
 }
 
 // ---------------- stock helpers ----------------
@@ -497,7 +549,6 @@ async function assertChildInMyFacility(req, childId) {
   return child;
 }
 
-
 async function buildChildSummaryPayload(childId) {
   const child = await prisma.child.findUnique({
     where: { id: childId },
@@ -628,7 +679,6 @@ router.post(
         enrollmentDate = parsed;
       }
 
-
       // Program eligibility: only children aged 6–23 months can be enrolled
       const ageMonthsAtEnrollment = computeAgeInMonths(dob, enrollmentDate);
       if (ageMonthsAtEnrollment < 6 || ageMonthsAtEnrollment > 23) {
@@ -691,8 +741,6 @@ router.post(
           data: enrichAssessmentData(normalized.data),
         };
       }
-
-
 
       // OPTIONAL: initial dispense captured during enrollment assessment (visit)
       // The mobile app sends this under `visit` with at least `sachetsDispensed` and `nextAppointmentDate`.
@@ -1296,7 +1344,6 @@ router.post(
         message: "Visit created",
         visit: { ...outVisit, dispenses: outDispenses },
       });
-
     } catch (err) {
       console.error(err);
       const status = err.statusCode || 500;
@@ -1379,7 +1426,6 @@ router.post(
           dispense: dispenses.map((d) => addLegacyDispenseFields(d, visit, childCheck)),
         });
       }
-
 
       // 2) Validate box
       const box = await prisma.box.findUnique({ where: { boxUid } });
