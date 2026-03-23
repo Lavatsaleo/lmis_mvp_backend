@@ -871,6 +871,286 @@ router.get("/children", requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/dashboard/children/:childId/measurements
+// Returns visit rows for the child details page. Safely enriches the enrollment
+// row with anthropometry captured during the in-depth assessment and exposes
+// sachets dispensed per visit.
+// -----------------------------------------------------------------------------
+
+router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
+  try {
+    const childId = String(req.params.childId);
+    const scope = await getScope(req);
+
+    const child = await prisma.child.findUnique({
+      where: { id: childId },
+      select: {
+        id: true,
+        uniqueChildNumber: true,
+        enrollmentDate: true,
+        facilityId: true,
+      },
+    });
+
+    if (!child) {
+      return res.status(404).json({ message: "Child not found" });
+    }
+
+    if (
+      scope.mode !== "ALL" &&
+      !scope.facilityIdsFacilitiesOnly.includes(child.facilityId)
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const [visitsRaw, enrollmentAssessment] = await Promise.all([
+      prisma.childVisit.findMany({
+        where: { childId },
+        orderBy: { visitDate: "asc" },
+        select: {
+          id: true,
+          visitDate: true,
+          notes: true,
+          weightKg: true,
+          heightCm: true,
+          muacMm: true,
+          whzScore: true,
+          nextAppointmentDate: true,
+          dispenses: {
+            select: { quantitySachets: true },
+          },
+        },
+      }),
+      prisma.inDepthAssessment.findFirst({
+        where: { childId, assessmentType: "ENROLLMENT" },
+        orderBy: { assessmentDate: "desc" },
+        select: {
+          assessmentDate: true,
+          data: true,
+          weightKg: true,
+          heightCm: true,
+          muacMm: true,
+        },
+      }),
+    ]);
+
+    const toNumberOrNull = (value) => {
+      if (value === null || value === undefined || value === "") return null;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const sameDay = (a, b) => {
+      if (!a || !b) return false;
+      const da = new Date(a);
+      const db = new Date(b);
+      return (
+        da.getFullYear() === db.getFullYear() &&
+        da.getMonth() === db.getMonth() &&
+        da.getDate() === db.getDate()
+      );
+    };
+
+    const getNested = (obj, path) => {
+      try {
+        return path.split(".").reduce((acc, key) => acc?.[key], obj);
+      } catch (_) {
+        return undefined;
+      }
+    };
+
+    const extractAssessmentMetrics = (assessment) => {
+      const data = assessment?.data || {};
+      const muacCandidate =
+        assessment?.muacMm ??
+        toNumberOrNull(getNested(data, "muacMm")) ??
+        toNumberOrNull(getNested(data, "muac")) ??
+        toNumberOrNull(getNested(data, "muacCm")) ??
+        toNumberOrNull(getNested(data, "anthropometrics.muacMm")) ??
+        toNumberOrNull(getNested(data, "anthropometrics.muac")) ??
+        toNumberOrNull(getNested(data, "anthropometrics.muacCm")) ??
+        toNumberOrNull(getNested(data, "answers.muacMm")) ??
+        toNumberOrNull(getNested(data, "answers.muac")) ??
+        toNumberOrNull(getNested(data, "answers.muacCm")) ??
+        toNumberOrNull(getNested(data, "answers.anthropometrics.muacMm")) ??
+        toNumberOrNull(getNested(data, "answers.anthropometrics.muac")) ??
+        toNumberOrNull(getNested(data, "answers.anthropometrics.muacCm"));
+
+      let muacMm = null;
+      if (Number.isFinite(muacCandidate)) {
+        muacMm =
+          muacCandidate > 0 && muacCandidate < 50
+            ? Math.round(muacCandidate * 10)
+            : Math.round(muacCandidate);
+      }
+
+      return {
+        weightKg:
+          assessment?.weightKg ??
+          toNumberOrNull(getNested(data, "weightKg")) ??
+          toNumberOrNull(getNested(data, "weight")) ??
+          toNumberOrNull(getNested(data, "anthropometrics.weightKg")) ??
+          toNumberOrNull(getNested(data, "anthropometrics.weight")) ??
+          toNumberOrNull(getNested(data, "answers.weightKg")) ??
+          toNumberOrNull(getNested(data, "answers.weight")) ??
+          toNumberOrNull(getNested(data, "answers.anthropometrics.weightKg")) ??
+          toNumberOrNull(getNested(data, "answers.anthropometrics.weight")),
+
+        heightCm:
+          assessment?.heightCm ??
+          toNumberOrNull(getNested(data, "heightCm")) ??
+          toNumberOrNull(getNested(data, "height")) ??
+          toNumberOrNull(getNested(data, "anthropometrics.heightCm")) ??
+          toNumberOrNull(getNested(data, "anthropometrics.height")) ??
+          toNumberOrNull(getNested(data, "answers.heightCm")) ??
+          toNumberOrNull(getNested(data, "answers.height")) ??
+          toNumberOrNull(getNested(data, "answers.anthropometrics.heightCm")) ??
+          toNumberOrNull(getNested(data, "answers.anthropometrics.height")),
+
+        muacMm,
+
+        whzScore:
+          toNumberOrNull(getNested(data, "whzScore")) ??
+          toNumberOrNull(getNested(data, "whz")) ??
+          toNumberOrNull(getNested(data, "anthropometrics.whzScore")) ??
+          toNumberOrNull(getNested(data, "anthropometrics.whz")) ??
+          toNumberOrNull(getNested(data, "answers.whzScore")) ??
+          toNumberOrNull(getNested(data, "answers.whz")) ??
+          toNumberOrNull(getNested(data, "answers.anthropometrics.whzScore")) ??
+          toNumberOrNull(getNested(data, "answers.anthropometrics.whz")),
+      };
+    };
+
+    const enrollmentMetrics = extractAssessmentMetrics(enrollmentAssessment);
+
+    let visits = visitsRaw.map((visit) => ({
+      id: visit.id,
+      visitDate: visit.visitDate,
+      notes: visit.notes,
+      weightKg: visit.weightKg,
+      heightCm: visit.heightCm,
+      muacMm: visit.muacMm,
+      whzScore: visit.whzScore,
+      nextAppointmentDate: visit.nextAppointmentDate,
+      sachetsDispensed: (visit.dispenses || []).reduce(
+        (sum, d) => sum + (Number(d.quantitySachets) || 0),
+        0
+      ),
+    }));
+
+    if (enrollmentAssessment) {
+      const enrollmentVisitIndex = visits.findIndex(
+        (visit) =>
+          /enrollment/i.test(String(visit.notes || "")) ||
+          sameDay(visit.visitDate, enrollmentAssessment.assessmentDate)
+      );
+
+      if (enrollmentVisitIndex >= 0) {
+        const visit = visits[enrollmentVisitIndex];
+        const hasAnyAnthro = [
+          visit.weightKg,
+          visit.heightCm,
+          visit.muacMm,
+          visit.whzScore,
+        ].some((v) => v !== null && v !== undefined && v !== "");
+
+        if (!hasAnyAnthro) {
+          visits[enrollmentVisitIndex] = {
+            ...visit,
+            weightKg: visit.weightKg ?? enrollmentMetrics.weightKg,
+            heightCm: visit.heightCm ?? enrollmentMetrics.heightCm,
+            muacMm: visit.muacMm ?? enrollmentMetrics.muacMm,
+            whzScore: visit.whzScore ?? enrollmentMetrics.whzScore,
+          };
+        }
+      } else if (visits.length === 0) {
+        visits = [
+          {
+            id: `enrollment-${child.id}`,
+            visitDate: enrollmentAssessment.assessmentDate,
+            notes: "Enrollment assessment",
+            weightKg: enrollmentMetrics.weightKg,
+            heightCm: enrollmentMetrics.heightCm,
+            muacMm: enrollmentMetrics.muacMm,
+            whzScore: enrollmentMetrics.whzScore,
+            nextAppointmentDate: null,
+            sachetsDispensed: 0,
+          },
+        ];
+      }
+    }
+
+    const today = startOfDay(new Date());
+
+    const computeAppointmentStatus = (currentVisit, nextVisit) => {
+      if (!currentVisit?.nextAppointmentDate) return null;
+
+      const dueDate = startOfDay(currentVisit.nextAppointmentDate);
+      const nextVisitDate = nextVisit?.visitDate
+        ? startOfDay(nextVisit.visitDate)
+        : null;
+
+      let status = "UPCOMING";
+      if (nextVisitDate) {
+        status = nextVisitDate <= dueDate ? "HONOURED" : "MISSED";
+      } else if (dueDate < today) {
+        status = "MISSED";
+      }
+
+      const lateUntil = nextVisitDate || today;
+      const daysOverdue =
+        status === "MISSED"
+          ? Math.max(
+              0,
+              Math.floor(
+                (lateUntil.getTime() - dueDate.getTime()) /
+                  (1000 * 60 * 60 * 24)
+              )
+            )
+          : 0;
+
+      return {
+        status,
+        nextAppointmentDate: currentVisit.nextAppointmentDate,
+        nextVisitDate: nextVisit?.visitDate || null,
+        daysOverdue,
+      };
+    };
+
+    visits = visits.map((visit, index) => {
+      const appt = computeAppointmentStatus(visit, visits[index + 1]);
+      return {
+        ...visit,
+        appointmentStatus: appt?.status || null,
+      };
+    });
+
+    let appointmentStatus = null;
+    for (let i = visits.length - 1; i >= 0; i -= 1) {
+      const appt = computeAppointmentStatus(visits[i], visits[i + 1]);
+      if (appt) {
+        appointmentStatus = appt;
+        break;
+      }
+    }
+
+    return res.json({
+      child: {
+        id: child.id,
+        uniqueChildNumber: child.uniqueChildNumber,
+        enrollmentDate: child.enrollmentDate,
+      },
+      appointmentStatus,
+      visits,
+    });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
 // -----------------------------------------------------------------------------
 // GET /api/dashboard/children/:childId/measurements
 // Returns visit rows for the child details page. Safely enriches the enrollment
