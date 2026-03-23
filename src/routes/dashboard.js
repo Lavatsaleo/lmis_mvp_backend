@@ -14,6 +14,9 @@ function startOfDay(d) {
   x.setHours(0, 0, 0, 0);
   return x;
 }
+function getActiveDayKey(d) {
+  return startOfDay(d).getTime();
+}
 
 /**
  * Scope rules (safe, won’t leak):
@@ -265,17 +268,19 @@ router.get("/overview", requireAuth, async (req, res) => {
 
     const dispenses = await prisma.dispense.findMany({
       where: {
-        createdAt: { gte: windowStart },
         boxId: { not: null },
         visit: selectedFacilityId
-          ? { facilityId: selectedFacilityId }
+          ? { facilityId: selectedFacilityId, visitDate: { gte: windowStart } }
           : scope.mode === "ALL"
-          ? undefined
-          : { facilityId: { in: scope.facilityIdsFacilitiesOnly } },
+          ? { visitDate: { gte: windowStart } }
+          : {
+              facilityId: { in: scope.facilityIdsFacilitiesOnly },
+              visitDate: { gte: windowStart },
+            },
       },
       select: {
         quantitySachets: true,
-        visit: { select: { facilityId: true } },
+        visit: { select: { facilityId: true, visitDate: true } },
         box: { select: { productId: true } },
       },
       take: 50000,
@@ -287,12 +292,22 @@ router.get("/overview", requireAuth, async (req, res) => {
     );
 
     const usageMap = new Map();
+    const activeDaysMap = new Map();
+
     for (const d of dispenses) {
       const facilityId = d.visit?.facilityId;
       const productId = d.box?.productId;
-      if (!facilityId || !productId) continue;
+      const visitDate = d.visit?.visitDate;
+      if (!facilityId || !productId || !visitDate) continue;
+
       const key = `${facilityId}__${productId}`;
-      usageMap.set(key, (usageMap.get(key) || 0) + (d.quantitySachets || 0));
+      usageMap.set(
+        key,
+        (usageMap.get(key) || 0) + (Number(d.quantitySachets) || 0)
+      );
+
+      if (!activeDaysMap.has(key)) activeDaysMap.set(key, new Set());
+      activeDaysMap.get(key).add(getActiveDayKey(visitDate));
     }
 
     const stockRows = await prisma.box.findMany({
@@ -316,14 +331,25 @@ router.get("/overview", requireAuth, async (req, res) => {
 
     const risk = [];
     for (const [key, totalDispensed] of usageMap.entries()) {
-      const avgDaily = totalDispensed / days;
+      const activeDispensingDays = activeDaysMap.get(key)?.size || 0;
+      const avgDaily =
+        activeDispensingDays > 0 ? totalDispensed / activeDispensingDays : 0;
+
       if (!avgDaily || avgDaily <= 0) continue;
+
       const onHand = stockMap.get(key) || 0;
       const daysOfStock = onHand / avgDaily;
 
       if (Number.isFinite(daysOfStock) && daysOfStock <= stockoutThresholdDays) {
         const [facilityId, productId] = key.split("__");
-        risk.push({ facilityId, productId, onHand, avgDaily, daysOfStock });
+        risk.push({
+          facilityId,
+          productId,
+          onHand,
+          avgDaily,
+          daysOfStock,
+          activeDispensingDays,
+        });
       }
     }
 
@@ -351,6 +377,7 @@ router.get("/overview", requireAuth, async (req, res) => {
       facility: rfMap.get(r.facilityId) || { id: r.facilityId },
       product: rpMap.get(r.productId) || { id: r.productId },
       onHandSachets: r.onHand,
+      activeDispensingDays: r.activeDispensingDays,
       avgDailyDispense: Number(r.avgDaily.toFixed(2)),
       daysOfStock: Number(r.daysOfStock.toFixed(1)),
     }));
@@ -500,28 +527,40 @@ router.get("/alerts", requireAuth, async (req, res) => {
 
     const dispenses = await prisma.dispense.findMany({
       where: {
-        createdAt: { gte: windowStart },
         boxId: { not: null },
         visit:
           scope.mode === "ALL"
-            ? undefined
-            : { facilityId: { in: scope.facilityIdsFacilitiesOnly } },
+            ? { visitDate: { gte: windowStart } }
+            : {
+                facilityId: { in: scope.facilityIdsFacilitiesOnly },
+                visitDate: { gte: windowStart },
+              },
       },
       select: {
         quantitySachets: true,
-        visit: { select: { facilityId: true } },
+        visit: { select: { facilityId: true, visitDate: true } },
         box: { select: { productId: true } },
       },
       take: 50000,
     });
 
     const usageMap = new Map();
+    const activeDaysMap = new Map();
+
     for (const d of dispenses) {
       const facilityId = d.visit?.facilityId;
       const productId = d.box?.productId;
-      if (!facilityId || !productId) continue;
+      const visitDate = d.visit?.visitDate;
+      if (!facilityId || !productId || !visitDate) continue;
+
       const key = `${facilityId}__${productId}`;
-      usageMap.set(key, (usageMap.get(key) || 0) + (d.quantitySachets || 0));
+      usageMap.set(
+        key,
+        (usageMap.get(key) || 0) + (Number(d.quantitySachets) || 0)
+      );
+
+      if (!activeDaysMap.has(key)) activeDaysMap.set(key, new Set());
+      activeDaysMap.get(key).add(getActiveDayKey(visitDate));
     }
 
     const stockRows = await prisma.box.findMany({
@@ -544,13 +583,24 @@ router.get("/alerts", requireAuth, async (req, res) => {
 
     const risk = [];
     for (const [key, totalDispensed] of usageMap.entries()) {
-      const avgDaily = totalDispensed / days;
+      const activeDispensingDays = activeDaysMap.get(key)?.size || 0;
+      const avgDaily =
+        activeDispensingDays > 0 ? totalDispensed / activeDispensingDays : 0;
+
       if (!avgDaily || avgDaily <= 0) continue;
+
       const onHand = stockMap.get(key) || 0;
       const daysOfStock = onHand / avgDaily;
       if (Number.isFinite(daysOfStock) && daysOfStock <= stockoutThresholdDays) {
         const [facilityId, productId] = key.split("__");
-        risk.push({ facilityId, productId, onHand, avgDaily, daysOfStock });
+        risk.push({
+          facilityId,
+          productId,
+          onHand,
+          avgDaily,
+          daysOfStock,
+          activeDispensingDays,
+        });
       }
     }
 
@@ -581,6 +631,7 @@ router.get("/alerts", requireAuth, async (req, res) => {
         facility: fMap.get(r.facilityId) || { id: r.facilityId },
         product: pMap.get(r.productId) || { id: r.productId },
         onHandSachets: r.onHand,
+        activeDispensingDays: r.activeDispensingDays,
         avgDailyDispense: Number(r.avgDaily.toFixed(2)),
         daysOfStock: Number(r.daysOfStock.toFixed(1)),
       });
@@ -655,22 +706,32 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
     // 2) Consumption in last N days (dispenses) grouped by product
     const dispenses = await prisma.dispense.findMany({
       where: {
-        createdAt: { gte: windowStart },
         boxId: { not: null },
-        visit: { facilityId: facilityId },
+        visit: { facilityId: facilityId, visitDate: { gte: windowStart } },
       },
       select: {
         quantitySachets: true,
         box: { select: { productId: true } },
+        visit: { select: { visitDate: true } },
       },
       take: 100000,
     });
 
-    const usageMap = new Map(); // productId => total dispensed
+    const usageMap = new Map();
+    const activeDaysMap = new Map();
+
     for (const d of dispenses) {
       const productId = d.box?.productId;
-      if (!productId) continue;
-      usageMap.set(productId, (usageMap.get(productId) || 0) + (d.quantitySachets || 0));
+      const visitDate = d.visit?.visitDate;
+      if (!productId || !visitDate) continue;
+
+      usageMap.set(
+        productId,
+        (usageMap.get(productId) || 0) + (Number(d.quantitySachets) || 0)
+      );
+
+      if (!activeDaysMap.has(productId)) activeDaysMap.set(productId, new Set());
+      activeDaysMap.get(productId).add(getActiveDayKey(visitDate));
     }
 
     // 3) Expiring soon in this facility
@@ -700,7 +761,9 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
         const boxesOnHand = r._count._all || 0;
 
         const totalDispensed = usageMap.get(r.productId) || 0;
-        const avgDailyDispense = totalDispensed / days;
+        const activeDispensingDays = activeDaysMap.get(r.productId)?.size || 0;
+        const avgDailyDispense =
+          activeDispensingDays > 0 ? totalDispensed / activeDispensingDays : 0;
 
         let daysOfStock = null;
         if (avgDailyDispense > 0) daysOfStock = onHandSachets / avgDailyDispense;
@@ -712,6 +775,7 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
           product: p,
           boxesOnHand,
           onHandSachets,
+          activeDispensingDays,
           avgDailyDispense: Number(avgDailyDispense.toFixed(2)),
           daysOfStock: daysOfStock === null ? null : Number(daysOfStock.toFixed(1)),
           isAtRisk,
@@ -1230,4 +1294,4 @@ router.get("/reports/honoured-follow-ups", requireAuth, async (req, res) => {
   }
 });
 
-module.exports = router; 
+module.exports = router;
