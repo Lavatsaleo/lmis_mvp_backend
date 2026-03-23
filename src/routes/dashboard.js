@@ -903,7 +903,7 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const [visitsRaw, enrollmentAssessment] = await Promise.all([
+    const [visitsRaw, inDepthAssessments] = await Promise.all([
       prisma.childVisit.findMany({
         where: { childId },
         orderBy: { visitDate: "asc" },
@@ -921,11 +921,13 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
           },
         },
       }),
-      prisma.inDepthAssessment.findFirst({
-        where: { childId, assessmentType: "ENROLLMENT" },
-        orderBy: { assessmentDate: "desc" },
+      prisma.inDepthAssessment.findMany({
+        where: { childId },
+        orderBy: { assessmentDate: "asc" },
         select: {
+          id: true,
           assessmentDate: true,
+          assessmentType: true,
           data: true,
           weightKg: true,
           heightCm: true,
@@ -936,7 +938,15 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
 
     const toNumberOrNull = (value) => {
       if (value === null || value === undefined || value === "") return null;
-      const n = Number(value);
+      if (typeof value === "number") return Number.isFinite(value) ? value : null;
+
+      const cleaned = String(value)
+        .trim()
+        .replace(/,/g, "")
+        .replace(/[^\d.-]/g, "");
+      if (!cleaned) return null;
+
+      const n = Number(cleaned);
       return Number.isFinite(n) ? n : null;
     };
 
@@ -951,77 +961,137 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       );
     };
 
-    const getNested = (obj, path) => {
-      try {
-        return path.split(".").reduce((acc, key) => acc?.[key], obj);
-      } catch (_) {
-        return undefined;
+    const dayDiffAbs = (a, b) => {
+      if (!a || !b) return Number.MAX_SAFE_INTEGER;
+      const da = startOfDay(a).getTime();
+      const db = startOfDay(b).getTime();
+      return Math.abs(Math.round((da - db) / (1000 * 60 * 60 * 24)));
+    };
+
+    const normalizeKey = (value) =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+
+    const collectLeafValues = (obj, path = "", out = []) => {
+      if (obj === null || obj === undefined) return out;
+
+      if (Array.isArray(obj)) {
+        obj.forEach((item, index) =>
+          collectLeafValues(item, `${path}[${index}]`, out)
+        );
+        return out;
       }
+
+      if (typeof obj === "object") {
+        Object.entries(obj).forEach(([key, value]) => {
+          const nextPath = path ? `${path}.${key}` : key;
+          collectLeafValues(value, nextPath, out);
+        });
+        return out;
+      }
+
+      out.push({ path, value: obj });
+      return out;
+    };
+
+    const findNumericByHints = (obj, hints = []) => {
+      const leaves = collectLeafValues(obj);
+      const normalizedHints = hints.map(normalizeKey);
+
+      for (const leaf of leaves) {
+        const key = normalizeKey(leaf.path);
+        if (!key) continue;
+
+        const matched = normalizedHints.some((hint) => key.includes(hint));
+        if (!matched) continue;
+
+        const n = toNumberOrNull(leaf.value);
+        if (n !== null) return n;
+      }
+
+      return null;
     };
 
     const extractAssessmentMetrics = (assessment) => {
       const data = assessment?.data || {};
-      const muacCandidate =
+
+      const weightRaw =
+        assessment?.weightKg ??
+        findNumericByHints(data, [
+          "weightkg",
+          "weight",
+          "childweight",
+          "currentweight",
+          "enrollmentweight",
+          "baselineweight",
+          "bodyweight",
+          "wt",
+        ]);
+
+      const heightRaw =
+        assessment?.heightCm ??
+        findNumericByHints(data, [
+          "heightcm",
+          "height",
+          "childheight",
+          "currentheight",
+          "baselineheight",
+          "lengthcm",
+          "length",
+          "childlength",
+        ]);
+
+      const muacRaw =
         assessment?.muacMm ??
-        toNumberOrNull(getNested(data, "muacMm")) ??
-        toNumberOrNull(getNested(data, "muac")) ??
-        toNumberOrNull(getNested(data, "muacCm")) ??
-        toNumberOrNull(getNested(data, "anthropometrics.muacMm")) ??
-        toNumberOrNull(getNested(data, "anthropometrics.muac")) ??
-        toNumberOrNull(getNested(data, "anthropometrics.muacCm")) ??
-        toNumberOrNull(getNested(data, "answers.muacMm")) ??
-        toNumberOrNull(getNested(data, "answers.muac")) ??
-        toNumberOrNull(getNested(data, "answers.muacCm")) ??
-        toNumberOrNull(getNested(data, "answers.anthropometrics.muacMm")) ??
-        toNumberOrNull(getNested(data, "answers.anthropometrics.muac")) ??
-        toNumberOrNull(getNested(data, "answers.anthropometrics.muacCm"));
+        findNumericByHints(data, [
+          "muacmm",
+          "muaccm",
+          "muac",
+          "middleupperarmcircumference",
+          "midupperarmcircumference",
+          "upperarmcircumference",
+          "armcircumference",
+        ]);
+
+      const whzRaw = findNumericByHints(data, [
+        "whzscore",
+        "whz",
+        "weightforheightzscore",
+        "weightforheightz",
+        "zwfh",
+        "wfhz",
+        "zscore",
+      ]);
 
       let muacMm = null;
-      if (Number.isFinite(muacCandidate)) {
+      if (Number.isFinite(muacRaw)) {
         muacMm =
-          muacCandidate > 0 && muacCandidate < 50
-            ? Math.round(muacCandidate * 10)
-            : Math.round(muacCandidate);
+          muacRaw > 0 && muacRaw < 50
+            ? Math.round(muacRaw * 10)
+            : Math.round(muacRaw);
       }
 
       return {
-        weightKg:
-          assessment?.weightKg ??
-          toNumberOrNull(getNested(data, "weightKg")) ??
-          toNumberOrNull(getNested(data, "weight")) ??
-          toNumberOrNull(getNested(data, "anthropometrics.weightKg")) ??
-          toNumberOrNull(getNested(data, "anthropometrics.weight")) ??
-          toNumberOrNull(getNested(data, "answers.weightKg")) ??
-          toNumberOrNull(getNested(data, "answers.weight")) ??
-          toNumberOrNull(getNested(data, "answers.anthropometrics.weightKg")) ??
-          toNumberOrNull(getNested(data, "answers.anthropometrics.weight")),
-
-        heightCm:
-          assessment?.heightCm ??
-          toNumberOrNull(getNested(data, "heightCm")) ??
-          toNumberOrNull(getNested(data, "height")) ??
-          toNumberOrNull(getNested(data, "anthropometrics.heightCm")) ??
-          toNumberOrNull(getNested(data, "anthropometrics.height")) ??
-          toNumberOrNull(getNested(data, "answers.heightCm")) ??
-          toNumberOrNull(getNested(data, "answers.height")) ??
-          toNumberOrNull(getNested(data, "answers.anthropometrics.heightCm")) ??
-          toNumberOrNull(getNested(data, "answers.anthropometrics.height")),
-
+        weightKg: Number.isFinite(weightRaw) ? weightRaw : null,
+        heightCm: Number.isFinite(heightRaw) ? heightRaw : null,
         muacMm,
-
-        whzScore:
-          toNumberOrNull(getNested(data, "whzScore")) ??
-          toNumberOrNull(getNested(data, "whz")) ??
-          toNumberOrNull(getNested(data, "anthropometrics.whzScore")) ??
-          toNumberOrNull(getNested(data, "anthropometrics.whz")) ??
-          toNumberOrNull(getNested(data, "answers.whzScore")) ??
-          toNumberOrNull(getNested(data, "answers.whz")) ??
-          toNumberOrNull(getNested(data, "answers.anthropometrics.whzScore")) ??
-          toNumberOrNull(getNested(data, "answers.anthropometrics.whz")),
+        whzScore: Number.isFinite(whzRaw) ? whzRaw : null,
       };
     };
 
-    const enrollmentMetrics = extractAssessmentMetrics(enrollmentAssessment);
+    const normalizedAssessments = (inDepthAssessments || [])
+      .map((assessment) => ({
+        id: assessment.id,
+        assessmentDate: assessment.assessmentDate,
+        assessmentType: assessment.assessmentType,
+        ...extractAssessmentMetrics(assessment),
+      }))
+      .filter((a) =>
+        [a.weightKg, a.heightCm, a.muacMm, a.whzScore].some(
+          (v) => v !== null && v !== undefined && v !== ""
+        )
+      );
 
     let visits = visitsRaw.map((visit) => ({
       id: visit.id,
@@ -1038,46 +1108,65 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
       ),
     }));
 
-    if (enrollmentAssessment) {
-      const enrollmentVisitIndex = visits.findIndex(
-        (visit) =>
-          /enrollment/i.test(String(visit.notes || "")) ||
-          sameDay(visit.visitDate, enrollmentAssessment.assessmentDate)
+    const hasAnthro = (visit) =>
+      [visit.weightKg, visit.heightCm, visit.muacMm, visit.whzScore].some(
+        (v) => v !== null && v !== undefined && v !== ""
       );
 
-      if (enrollmentVisitIndex >= 0) {
-        const visit = visits[enrollmentVisitIndex];
-        const hasAnyAnthro = [
-          visit.weightKg,
-          visit.heightCm,
-          visit.muacMm,
-          visit.whzScore,
-        ].some((v) => v !== null && v !== undefined && v !== "");
+    const nearestAssessmentForVisit = (visitDate) => {
+      if (!visitDate || !normalizedAssessments.length) return null;
 
-        if (!hasAnyAnthro) {
-          visits[enrollmentVisitIndex] = {
-            ...visit,
-            weightKg: visit.weightKg ?? enrollmentMetrics.weightKg,
-            heightCm: visit.heightCm ?? enrollmentMetrics.heightCm,
-            muacMm: visit.muacMm ?? enrollmentMetrics.muacMm,
-            whzScore: visit.whzScore ?? enrollmentMetrics.whzScore,
-          };
-        }
-      } else if (visits.length === 0) {
-        visits = [
-          {
-            id: `enrollment-${child.id}`,
-            visitDate: enrollmentAssessment.assessmentDate,
-            notes: "Enrollment assessment",
-            weightKg: enrollmentMetrics.weightKg,
-            heightCm: enrollmentMetrics.heightCm,
-            muacMm: enrollmentMetrics.muacMm,
-            whzScore: enrollmentMetrics.whzScore,
-            nextAppointmentDate: null,
-            sachetsDispensed: 0,
-          },
-        ];
+      const sameDayMatch = normalizedAssessments.find((a) =>
+        sameDay(a.assessmentDate, visitDate)
+      );
+      if (sameDayMatch) return sameDayMatch;
+
+      const nearMatches = normalizedAssessments
+        .map((a) => ({
+          ...a,
+          diff: dayDiffAbs(a.assessmentDate, visitDate),
+        }))
+        .filter((a) => a.diff <= 7)
+        .sort((a, b) => a.diff - b.diff);
+
+      return nearMatches[0] || null;
+    };
+
+    visits = visits.map((visit, index) => {
+      if (hasAnthro(visit)) return visit;
+
+      let matched = nearestAssessmentForVisit(visit.visitDate);
+
+      if (!matched && index === 0 && normalizedAssessments.length > 0) {
+        matched = normalizedAssessments[0];
       }
+
+      if (!matched) return visit;
+
+      return {
+        ...visit,
+        weightKg: visit.weightKg ?? matched.weightKg,
+        heightCm: visit.heightCm ?? matched.heightCm,
+        muacMm: visit.muacMm ?? matched.muacMm,
+        whzScore: visit.whzScore ?? matched.whzScore,
+      };
+    });
+
+    if (visits.length === 0 && normalizedAssessments.length > 0) {
+      const first = normalizedAssessments[0];
+      visits = [
+        {
+          id: `enrollment-${child.id}`,
+          visitDate: first.assessmentDate,
+          notes: "Enrollment assessment",
+          weightKg: first.weightKg,
+          heightCm: first.heightCm,
+          muacMm: first.muacMm,
+          whzScore: first.whzScore,
+          nextAppointmentDate: null,
+          sachetsDispensed: 0,
+        },
+      ];
     }
 
     const today = startOfDay(new Date());
