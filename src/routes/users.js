@@ -2,20 +2,16 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const { z } = require("zod");
 
-// ✅ Use the same prisma you use elsewhere
 const prisma = require("../lib/prisma");
-
 const { requireAuth } = require("../middleware/auth");
 const { requireRole } = require("../middleware/rbac");
 
 const router = express.Router();
 
-// ✅ Logged-in user info
 router.get("/me", requireAuth, async (req, res) => {
   return res.json({ user: req.user });
 });
 
-// ✅ SUPER_ADMIN creates new users
 const createUserSchema = z.object({
   email: z.string().email(),
   fullName: z.string().min(2),
@@ -34,7 +30,6 @@ router.post("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req,
     const { email, fullName, password, role } = parsed.data;
     const facilityCode = parsed.data.facilityCode ? String(parsed.data.facilityCode).trim() : null;
 
-    // VIEWER allowed to be global (no facility)
     if (role !== "SUPER_ADMIN" && role !== "VIEWER" && !facilityCode) {
       return res.status(400).json({ message: "facilityCode is required for this role" });
     }
@@ -80,7 +75,14 @@ router.post("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req,
 
     return res.status(201).json({
       message: "User created",
-      user: { id: user.id, email: user.email, fullName: user.fullName, role: user.role, facilityId: user.facilityId },
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.fullName,
+        role: user.role,
+        facilityId: user.facilityId,
+        lastLoginAt: user.lastLoginAt,
+      },
     });
   } catch (err) {
     if (err?.code === "P2002") return res.status(409).json({ message: "Email already exists" });
@@ -89,7 +91,6 @@ router.post("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req,
   }
 });
 
-// ✅ List users
 router.get("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
   try {
     const take = Math.min(200, Math.max(1, Number.parseInt(req.query.take || "50", 10)));
@@ -132,6 +133,7 @@ router.get("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req, 
           facilityId: true,
           facility: { select: { id: true, code: true, name: true, type: true } },
           createdAt: true,
+          lastLoginAt: true,
         },
       }),
     ]);
@@ -143,7 +145,6 @@ router.get("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req, 
   }
 });
 
-// ✅ Enable/disable + optional password reset
 const updateUserSchema = z.object({
   isActive: z.boolean().optional(),
   password: z.string().min(8).optional(),
@@ -172,6 +173,7 @@ router.patch("/admin/users/:userId", requireAuth, requireRole("SUPER_ADMIN"), as
         role: true,
         isActive: true,
         facilityId: true,
+        lastLoginAt: true,
         facility: { select: { id: true, code: true, name: true, type: true } },
       },
     });
