@@ -2,7 +2,7 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const { z } = require("zod");
 const { prisma } = require("../db");
-const { signToken } = require("../utils");
+const { signToken, ACCESS_TOKEN_EXPIRES_IN } = require("../utils");
 
 const router = express.Router();
 
@@ -14,7 +14,10 @@ const loginSchema = z.object({
 router.post("/login", async (req, res) => {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ message: "Invalid input", errors: parsed.error.flatten() });
+    return res.status(400).json({
+      message: "Invalid input",
+      errors: parsed.error.flatten(),
+    });
   }
 
   const { email, password } = parsed.data;
@@ -29,7 +32,9 @@ router.post("/login", async (req, res) => {
   }
 
   const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) return res.status(401).json({ message: "Invalid credentials" });
+  if (!ok) {
+    return res.status(401).json({ message: "Invalid credentials" });
+  }
 
   const token = signToken({
     userId: user.id,
@@ -39,13 +44,20 @@ router.post("/login", async (req, res) => {
 
   return res.json({
     token,
+    expiresIn: ACCESS_TOKEN_EXPIRES_IN,
     user: {
       id: user.id,
       email: user.email,
       fullName: user.fullName,
       role: user.role,
       facilityId: user.facilityId,
-      facility: user.facility ? { id: user.facility.id, code: user.facility.code, name: user.facility.name } : null,
+      facility: user.facility
+        ? {
+            id: user.facility.id,
+            code: user.facility.code,
+            name: user.facility.name,
+          }
+        : null,
     },
   });
 });
