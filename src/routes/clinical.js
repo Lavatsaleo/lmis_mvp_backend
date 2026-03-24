@@ -41,7 +41,23 @@ function startOfDay(value = new Date()) {
   d.setHours(0, 0, 0, 0);
   return d;
 }
+async function findExistingVisitForSameChildAndDay(client, { childId, facilityId, visitDate }) {
+  const dayStart = startOfDay(visitDate);
+  const dayEnd = new Date(dayStart);
+  dayEnd.setDate(dayEnd.getDate() + 1);
 
+  return client.childVisit.findFirst({
+    where: {
+      childId,
+      facilityId,
+      visitDate: {
+        gte: dayStart,
+        lt: dayEnd,
+      },
+    },
+    orderBy: [{ visitDate: "asc" }, { id: "asc" }],
+  });
+}
 function formatDateOnly(value) {
   const d = normalizeDateOnly(value);
   if (!d) return null;
@@ -1196,7 +1212,6 @@ router.post(
 
       const whzScore = toNumberOrNull(body.whzScore ?? body.whz);
 
-      // Optional next appointment date
       let nextAppointmentDate = null;
       if (
         body.nextAppointmentDate !== undefined &&
@@ -1212,9 +1227,32 @@ router.post(
         nextAppointmentDate = parsedNext;
       }
 
-      // Optional dispense payload:
-      //  - either { quantitySachets, boxUid, dispenseNote }
-      //  - or { dispenses: [{ quantitySachets, boxUid, note }, ...] }
+      const existingSameDayVisit = await findExistingVisitForSameChildAndDay(prisma, {
+        childId: childCheck.id,
+        facilityId: childCheck.facilityId,
+        visitDate,
+      });
+
+      if (existingSameDayVisit) {
+        const existingVisitWithDispenses = await prisma.childVisit.findUnique({
+          where: { id: existingSameDayVisit.id },
+          include: { dispenses: true },
+        });
+
+        const outVisit = addLegacyVisitFields(existingVisitWithDispenses);
+        const outDispenses = (existingVisitWithDispenses?.dispenses || []).map((d) =>
+          addLegacyDispenseFields(d, existingVisitWithDispenses, childCheck)
+        );
+
+        return res.status(409).json({
+          message: `A visit for this child already exists on ${formatDateOnly(visitDate)}. Open the existing visit instead of creating another one.`,
+          existingVisit: {
+            ...outVisit,
+            dispenses: outDispenses,
+          },
+        });
+      }
+
       const dispenseItems = Array.isArray(body.dispenses)
         ? body.dispenses
         : body.quantitySachets != null || body.sachetsGiven != null
@@ -1235,14 +1273,10 @@ router.post(
             performedByUserId: req.user.id,
             visitDate,
             notes: body.notes ? String(body.notes) : null,
-
-            // Anthropometry + WHZ
             weightKg,
             heightCm,
             muacMm,
             whzScore,
-
-            // Scheduling
             nextAppointmentDate,
           },
         });
@@ -1260,7 +1294,6 @@ router.post(
           const boxUid = item?.boxUid ? String(item.boxUid).trim() : null;
           const note = item?.note ? String(item.note) : null;
 
-          // If client didn't scan a box, auto-allocate from facility stock (FEFO)
           if (!boxUid) {
             const auto = await autoAllocateDispenseFromFacility(tx, {
               facilityId: childCheck.facilityId,
@@ -1312,7 +1345,6 @@ router.post(
 
           createdDispenses.push(d);
 
-          // Update box sachet balance. Mark as DISPENSED only when empty.
           await tx.box.update({
             where: { id: box.id },
             data: {
@@ -1376,8 +1408,7 @@ router.post(
       if (childCheck === "FORBIDDEN") return res.status(403).json({ message: "Forbidden" });
 
       const body = req.body || {};
-      const quantitySachets =
-        Number(body.quantitySachets ?? body.sachetsGiven);
+      const quantitySachets = Number(body.quantitySachets ?? body.sachetsGiven);
 
       if (!Number.isFinite(quantitySachets) || quantitySachets <= 0) {
         return res.status(400).json({ message: "quantitySachets (or sachetsGiven) must be a positive number" });
@@ -1387,26 +1418,37 @@ router.post(
       const note = body.note ? String(body.note) : null;
       const boxUid = body.boxUid ? String(body.boxUid).trim() : null;
 
-      // 1) Resolve visit (schema requires a visitId). If none provided, auto-create a visit.
       let visit = null;
+
       if (visitIdRaw) {
         visit = await prisma.childVisit.findUnique({ where: { id: String(visitIdRaw) } });
         if (!visit || visit.childId !== childCheck.id) {
           return res.status(400).json({ message: "visitId is invalid for this child" });
         }
       } else {
-        visit = await prisma.childVisit.create({
-          data: {
-            childId: childCheck.id,
-            facilityId: childCheck.facilityId,
-            performedByUserId: req.user.id,
-            visitDate: new Date(),
-            notes: "Auto-created visit for dispensing",
-          },
+        const today = new Date();
+
+        const existingSameDayVisit = await findExistingVisitForSameChildAndDay(prisma, {
+          childId: childCheck.id,
+          facilityId: childCheck.facilityId,
+          visitDate: today,
         });
+
+        if (existingSameDayVisit) {
+          visit = existingSameDayVisit;
+        } else {
+          visit = await prisma.childVisit.create({
+            data: {
+              childId: childCheck.id,
+              facilityId: childCheck.facilityId,
+              performedByUserId: req.user.id,
+              visitDate: today,
+              notes: "Auto-created visit for dispensing",
+            },
+          });
+        }
       }
 
-      // If client didn't scan a box, auto-allocate from facility stock (FEFO)
       if (!boxUid) {
         const dispenses = await prisma.$transaction(async (tx) => {
           const auto = await autoAllocateDispenseFromFacility(tx, {
@@ -1427,7 +1469,6 @@ router.post(
         });
       }
 
-      // 2) Validate box
       const box = await prisma.box.findUnique({ where: { boxUid } });
       if (!box) return res.status(404).json({ message: "Box not found" });
 
