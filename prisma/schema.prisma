@@ -114,12 +114,29 @@ model User {
   dispatchedShipments Shipment[] @relation("ShipmentsDispatchedBy")
   receivedShipments   Shipment[] @relation("ShipmentsReceivedBy")
 
+  // Auth refresh tokens
+  refreshTokens RefreshToken[]
+
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   shipmentItems ShipmentItem[]
 
   @@index([facilityId])
   @@index([role])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 model Order {

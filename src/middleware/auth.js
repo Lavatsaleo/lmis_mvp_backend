@@ -1,4 +1,4 @@
-const { verifyToken } = require("../utils");
+const { verifyAccessToken } = require("../utils");
 const { prisma } = require("../db");
 
 async function requireAuth(req, res, next) {
@@ -10,7 +10,7 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ message: "Missing or invalid Authorization header" });
     }
 
-    const decoded = verifyToken(token);
+    const decoded = verifyAccessToken(token);
 
     // Pull fresh user from DB (so disabled users are blocked)
     // Include facility + its warehouse (does NOT break anything, just gives us more context)
@@ -43,7 +43,11 @@ async function requireAuth(req, res, next) {
       user.facility?.type === "WAREHOUSE"
         ? { id: user.facility.id, code: user.facility.code, name: user.facility.name }
         : user.facility?.warehouse
-        ? { id: user.facility.warehouse.id, code: user.facility.warehouse.code, name: user.facility.warehouse.name }
+        ? {
+            id: user.facility.warehouse.id,
+            code: user.facility.warehouse.code,
+            name: user.facility.warehouse.name,
+          }
         : null;
 
     req.user = {
@@ -58,10 +62,10 @@ async function requireAuth(req, res, next) {
         ? { id: user.facility.id, code: user.facility.code, name: user.facility.name }
         : null,
 
-      // ✅ NEW (safe additions)
-      facilityType, // "WAREHOUSE" | "FACILITY" | null
-      warehouseId,  // warehouse scope id or null
-      warehouse,    // {id,code,name} or null
+      // safe additions
+      facilityType,
+      warehouseId,
+      warehouse,
     };
 
     next();
