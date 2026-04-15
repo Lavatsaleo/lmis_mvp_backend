@@ -1,45 +1,55 @@
 const jwt = require("jsonwebtoken");
-const crypto = require("crypto");
 
-const ACCESS_TOKEN_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1h";
-const REFRESH_TOKEN_EXPIRES_IN_DAYS = Number(process.env.REFRESH_TOKEN_EXPIRES_IN_DAYS || 30);
+const ACCESS_TOKEN_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "8h";
+const REFRESH_TOKEN_EXPIRES_IN = process.env.JWT_REFRESH_EXPIRES_IN || "30d";
 
-function getJwtSecret() {
+function getAccessSecret() {
   const secret = process.env.JWT_SECRET;
   if (!secret) throw new Error("JWT_SECRET missing in .env");
   return secret;
 }
 
-function signAccessToken(payload) {
-  return jwt.sign(payload, getJwtSecret(), {
+function getRefreshSecret() {
+  return process.env.JWT_REFRESH_SECRET || getAccessSecret();
+}
+
+function signToken(payload) {
+  return jwt.sign(payload, getAccessSecret(), {
     expiresIn: ACCESS_TOKEN_EXPIRES_IN,
   });
 }
 
+function signAccessToken(payload) {
+  return jwt.sign(payload, getAccessSecret(), {
+    expiresIn: ACCESS_TOKEN_EXPIRES_IN,
+  });
+}
+
+function signRefreshToken(payload) {
+  return jwt.sign(payload, getRefreshSecret(), {
+    expiresIn: REFRESH_TOKEN_EXPIRES_IN,
+  });
+}
+
+function verifyToken(token) {
+  return jwt.verify(token, getAccessSecret());
+}
+
 function verifyAccessToken(token) {
-  return jwt.verify(token, getJwtSecret());
+  return jwt.verify(token, getAccessSecret());
 }
 
-function generateRefreshToken() {
-  return crypto.randomBytes(64).toString("hex");
-}
-
-function hashRefreshToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-function getRefreshTokenExpiryDate() {
-  const d = new Date();
-  d.setDate(d.getDate() + REFRESH_TOKEN_EXPIRES_IN_DAYS);
-  return d;
+function verifyRefreshToken(token) {
+  return jwt.verify(token, getRefreshSecret());
 }
 
 module.exports = {
+  signToken,
   signAccessToken,
+  signRefreshToken,
+  verifyToken,
   verifyAccessToken,
-  generateRefreshToken,
-  hashRefreshToken,
-  getRefreshTokenExpiryDate,
+  verifyRefreshToken,
   ACCESS_TOKEN_EXPIRES_IN,
-  REFRESH_TOKEN_EXPIRES_IN_DAYS,
+  REFRESH_TOKEN_EXPIRES_IN,
 };
