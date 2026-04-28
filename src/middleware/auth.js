@@ -6,32 +6,56 @@ async function requireAuth(req, res, next) {
     const header = req.headers.authorization || "";
     const [type, token] = header.split(" ");
 
+    console.log("AUTH DEBUG INCOMING", {
+      method: req.method,
+      path: req.originalUrl,
+      hasAuthorizationHeader: !!header,
+      authType: type || null,
+      tokenPresent: !!token,
+      tokenPreview: token ? `${token.slice(0, 12)}...${token.slice(-8)}` : null,
+    });
+
     if (type !== "Bearer" || !token) {
+      console.log("AUTH DEBUG REJECTED", {
+        reason: "Missing or invalid Authorization header",
+        method: req.method,
+        path: req.originalUrl,
+        rawAuthorizationHeader: header || null,
+      });
       return res.status(401).json({ message: "Missing or invalid Authorization header" });
     }
 
     const decoded = verifyAccessToken(token);
 
-    // Pull fresh user from DB (so disabled users are blocked)
-    // Include facility + its warehouse (does NOT break anything, just gives us more context)
+    console.log("AUTH DEBUG TOKEN OK", {
+      method: req.method,
+      path: req.originalUrl,
+      userIdFromToken: decoded.userId,
+      roleFromToken: decoded.role,
+      facilityIdFromToken: decoded.facilityId || null,
+    });
+
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
       include: {
         facility: {
           include: {
-            warehouse: true, // works because Facility has warehouse relation now
+            warehouse: true,
           },
         },
       },
     });
 
     if (!user || !user.isActive) {
+      console.log("AUTH DEBUG REJECTED", {
+        reason: "User not found or disabled",
+        method: req.method,
+        path: req.originalUrl,
+        decodedUserId: decoded.userId,
+      });
       return res.status(401).json({ message: "User not found or disabled" });
     }
 
-    // Compute warehouse scope:
-    // - If user is assigned to a WAREHOUSE facility => warehouseId = that facility id
-    // - If user is assigned to a FACILITY => warehouseId = facility.warehouseId
     const facilityType = user.facility ? user.facility.type : null;
 
     const warehouseId =
@@ -56,13 +80,9 @@ async function requireAuth(req, res, next) {
       fullName: user.fullName,
       role: user.role,
       facilityId: user.facilityId,
-
-      // keep existing shape (so nothing breaks)
       facility: user.facility
         ? { id: user.facility.id, code: user.facility.code, name: user.facility.name }
         : null,
-
-      // safe additions
       facilityType,
       warehouseId,
       warehouse,
@@ -70,6 +90,12 @@ async function requireAuth(req, res, next) {
 
     next();
   } catch (err) {
+    console.log("AUTH DEBUG VERIFY FAILED", {
+      method: req.method,
+      path: req.originalUrl,
+      error: String(err.message || err),
+    });
+
     return res.status(401).json({ message: "Unauthorized", error: String(err.message || err) });
   }
 }
