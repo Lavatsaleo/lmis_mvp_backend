@@ -41,6 +41,7 @@ function startOfDay(value = new Date()) {
   d.setHours(0, 0, 0, 0);
   return d;
 }
+
 async function findExistingVisitForSameChildAndDay(client, { childId, facilityId, visitDate }) {
   const dayStart = startOfDay(visitDate);
   const dayEnd = new Date(dayStart);
@@ -58,6 +59,7 @@ async function findExistingVisitForSameChildAndDay(client, { childId, facilityId
     orderBy: [{ visitDate: "asc" }, { id: "asc" }],
   });
 }
+
 function formatDateOnly(value) {
   const d = normalizeDateOnly(value);
   if (!d) return null;
@@ -339,9 +341,7 @@ function computeHhsFromData(d) {
   const scoreQuestion = (occ, freq) => {
     if (!Number.isFinite(occ)) return null;
     if (occ === 0) return 0;
-    // if yes but missing freq, assume minimally 1
     if (!Number.isFinite(freq)) return 1;
-    // Form uses: 1=Rarely, 2=Sometimes, 3=Often. HHS recode: rarely/sometimes=1, often=2
     if (freq === 3) return 2;
     return 1;
   };
@@ -352,7 +352,7 @@ function computeHhsFromData(d) {
 
   if ([s1, s2, s3].some((x) => x === null)) return null;
 
-  const score = s1 + s2 + s3; // 0..6
+  const score = s1 + s2 + s3;
   return { score, category: hungerCategoryFromScore(score) };
 }
 
@@ -373,7 +373,7 @@ function computePssFromData(d) {
 
   if (![q1, q2, q3, q4, q5].every((x) => Number.isFinite(x))) return null;
 
-  const score = q1 + q2 + q3 + q4 + q5; // 0..10
+  const score = q1 + q2 + q3 + q4 + q5;
   let category = null;
   if (score <= 2) category = "Low psycho-social risk";
   else if (score <= 5) category = "Moderate distress";
@@ -386,7 +386,6 @@ function enrichAssessmentData(data) {
   const obj = isPlainObject(data) ? { ...data } : {};
   const derived = isPlainObject(obj.derived) ? { ...obj.derived } : {};
 
-  // HHS
   if (derived.hhsScore == null && derived.householdHungerScore == null) {
     const hhs = computeHhsFromData(obj);
     if (hhs) {
@@ -397,7 +396,6 @@ function enrichAssessmentData(data) {
     }
   }
 
-  // PSS
   if (derived.pssScore == null) {
     const pss = computePssFromData(obj);
     if (pss) {
@@ -410,10 +408,6 @@ function enrichAssessmentData(data) {
   return obj;
 }
 
-/**
- * Extract a few “fast query” fields from the assessment JSON.
- * We keep this defensive because your frontend field names may evolve.
- */
 function sameDay(a, b) {
   if (!a || !b) return false;
   const da = new Date(a);
@@ -449,7 +443,9 @@ function extractAssessmentVisitMetrics(data) {
 
 function visitHasAnthroMetrics(visit) {
   if (!visit) return false;
-  return [visit.weightKg, visit.heightCm, visit.muacMm, visit.whzScore].some((v) => v !== null && v !== undefined && v !== "");
+  return [visit.weightKg, visit.heightCm, visit.muacMm, visit.whzScore].some(
+    (v) => v !== null && v !== undefined && v !== ""
+  );
 }
 
 function enrichVisitFromAssessmentIfNeeded(visit, assessment) {
@@ -477,7 +473,6 @@ function enrichVisitFromAssessmentIfNeeded(visit, assessment) {
 function extractAssessmentQuickFields(data) {
   const d = data || {};
 
-  // Try common paths (you can standardize later)
   const muacCandidate =
     toNumberOrNull(d.muacMm) ??
     toNumberOrNull(d.muac) ??
@@ -494,7 +489,6 @@ function extractAssessmentQuickFields(data) {
 
   let muacMm = null;
   if (Number.isFinite(muacCandidate)) {
-    // Heuristic: if it looks like cm (e.g., 11.5–20), convert to mm
     if (muacCandidate > 0 && muacCandidate < 50) muacMm = Math.round(muacCandidate * 10);
     else muacMm = Math.round(muacCandidate);
   }
@@ -543,12 +537,10 @@ function extractAssessmentQuickFields(data) {
 }
 
 async function resolveFacilityForClinical(req, body) {
-  // SUPER_ADMIN may act on a facility using facilityCode
   if (req.user.role === "SUPER_ADMIN" && body.facilityCode) {
     return prisma.facility.findUnique({ where: { code: String(body.facilityCode).trim() } });
   }
 
-  // Everyone else uses their assigned facility
   if (!req.user.facilityId) return null;
   return prisma.facility.findUnique({ where: { id: req.user.facilityId } });
 }
@@ -557,7 +549,6 @@ async function assertChildInMyFacility(req, childId) {
   const child = await prisma.child.findUnique({ where: { id: childId } });
   if (!child) return null;
 
-  // SUPER_ADMIN can access any facility
   if (req.user.role === "SUPER_ADMIN") return child;
 
   if (!req.user.facilityId) return null;
@@ -636,13 +627,6 @@ async function buildChildSummaryPayload(childId) {
 
 // ---------------- routes ----------------
 
-/**
- * 1) Enroll child + caregiver (Option 1)
- * POST /api/clinical/enroll
- *
- * We keep your old request body keys working, but map them into the new Prisma schema.
- * OPTIONAL: include `inDepthAssessment` to save baseline assessment immediately.
- */
 router.post(
   "/enroll",
   requireAuth,
@@ -651,7 +635,6 @@ router.post(
     try {
       const body = req.body || {};
 
-      // Backward compatible inputs (old UI) + allow newer keys
       const caregiverName = String(body.caregiverName ?? body.fullName ?? "").trim();
       const caregiverContacts = String(body.caregiverContacts ?? body.contacts ?? "").trim();
       const village = body.village ? String(body.village).trim() : null;
@@ -687,7 +670,11 @@ router.post(
       }
 
       let enrollmentDate = new Date();
-      if (body.enrollmentDate !== undefined && body.enrollmentDate !== null && String(body.enrollmentDate).trim() !== "") {
+      if (
+        body.enrollmentDate !== undefined &&
+        body.enrollmentDate !== null &&
+        String(body.enrollmentDate).trim() !== ""
+      ) {
         const parsed = parseDateOrNull(body.enrollmentDate);
         if (!parsed) {
           return res.status(400).json({ message: "enrollmentDate must be a valid date (YYYY-MM-DD)" });
@@ -695,7 +682,6 @@ router.post(
         enrollmentDate = parsed;
       }
 
-      // Program eligibility: only children aged 6–23 months can be enrolled
       const ageMonthsAtEnrollment = computeAgeInMonths(dob, enrollmentDate);
       if (ageMonthsAtEnrollment < 6 || ageMonthsAtEnrollment > 23) {
         return res.status(400).json({
@@ -715,7 +701,6 @@ router.post(
         program,
       });
 
-      // Prevent duplicates: same CWC number in the same facility (and also registration number)
       const existingChild = await prisma.child.findFirst({
         where: {
           OR: [{ uniqueChildNumber }, { facilityId: facility.id, cwcNumber }],
@@ -729,19 +714,19 @@ router.post(
         });
       }
 
-      // Validate OPTIONAL baseline assessment *before* transaction (safer)
       let baselineAssessmentInput = null;
       if (body.inDepthAssessment != null) {
         if (!isPlainObject(body.inDepthAssessment)) {
           return res.status(400).json({ message: "inDepthAssessment must be an object" });
         }
 
-        // strict validation: if a date was provided and it's invalid, fail
         const rawDate = body.inDepthAssessment.assessmentDate ?? body.inDepthAssessment.assessedAt;
         if (rawDate !== undefined && rawDate !== null && String(rawDate).trim() !== "") {
           const parsed = parseDateOrNull(rawDate);
           if (!parsed) {
-            return res.status(400).json({ message: "inDepthAssessment.assessmentDate (or assessedAt) must be a valid date (YYYY-MM-DD)" });
+            return res.status(400).json({
+              message: "inDepthAssessment.assessmentDate (or assessedAt) must be a valid date (YYYY-MM-DD)",
+            });
           }
         }
 
@@ -758,8 +743,6 @@ router.post(
         };
       }
 
-      // OPTIONAL: initial dispense captured during enrollment assessment (visit)
-      // The mobile app sends this under `visit` with at least `sachetsDispensed` and `nextAppointmentDate`.
       let enrollmentVisitInput = null;
       if (isPlainObject(body.visit)) {
         const v = body.visit;
@@ -769,7 +752,11 @@ router.post(
         }
 
         let nextAppointmentDate = null;
-        if (v.nextAppointmentDate !== undefined && v.nextAppointmentDate !== null && String(v.nextAppointmentDate).trim() !== "") {
+        if (
+          v.nextAppointmentDate !== undefined &&
+          v.nextAppointmentDate !== null &&
+          String(v.nextAppointmentDate).trim() !== ""
+        ) {
           const parsedNext = parseDateOrNull(v.nextAppointmentDate);
           if (!parsedNext) {
             return res.status(400).json({ message: "visit.nextAppointmentDate must be a valid date (YYYY-MM-DD)" });
@@ -783,8 +770,8 @@ router.post(
           notes: v.notes ? String(v.notes) : null,
         };
       }
+
       const created = await prisma.$transaction(async (tx) => {
-        // Find caregiver by same contacts in the SAME facility (MVP rule)
         let caregiver = await tx.caregiver.findFirst({
           where: {
             facilityId: facility.id,
@@ -793,23 +780,36 @@ router.post(
         });
 
         if (!caregiver) {
-          caregiver = await tx.caregiver.create({
-            data: {
-              facilityId: facility.id,
-              fullName: caregiverName,
-              contacts: caregiverContacts,
-              village,
-            },
-          });
+          try {
+            caregiver = await tx.caregiver.create({
+              data: {
+                facilityId: facility.id,
+                fullName: caregiverName,
+                contacts: caregiverContacts,
+                village,
+              },
+            });
+          } catch (err) {
+            if (err?.code === "P2002") {
+              caregiver = await tx.caregiver.findFirst({
+                where: {
+                  facilityId: facility.id,
+                  contacts: caregiverContacts,
+                },
+              });
+              if (!caregiver) throw err;
+            } else {
+              throw err;
+            }
+          }
         }
 
-        const sex = body.sex ? String(body.sex).toUpperCase() : "UNKNOWN"; // schema requires String
+        const sex = body.sex ? String(body.sex).toUpperCase() : "UNKNOWN";
 
         const child = await tx.child.create({
           data: {
             facilityId: facility.id,
             caregiverId: caregiver.id,
-
             firstName: childFirstName,
             lastName: childLastName,
             sex,
@@ -818,12 +818,11 @@ router.post(
             uniqueChildNumber,
             program,
             enrollmentDate,
-
             chpName: body.chpName ? String(body.chpName).trim() : null,
             chpContacts: body.chpContacts ? String(body.chpContacts).trim() : null,
           },
         });
-        // OPTIONAL: baseline in-depth assessment saved immediately
+
         let assessment = null;
         if (baselineAssessmentInput) {
           const quick = extractAssessmentQuickFields(baselineAssessmentInput.data);
@@ -836,13 +835,11 @@ router.post(
               assessmentType: "ENROLLMENT",
               assessmentDate: baselineAssessmentInput.assessmentDate,
               data: baselineAssessmentInput.data,
-
               ...quick,
             },
           });
         }
 
-        // OPTIONAL: record initial dispense during enrollment (no box scanning in the client)
         let enrollmentVisit = null;
         let enrollmentDispenses = [];
         if (enrollmentVisitInput) {
@@ -887,7 +884,9 @@ router.post(
         child: addLegacyChildFields(created.child),
         assessment: addLegacyAssessmentFields(created.assessment),
         visit: created.enrollmentVisit ? addLegacyVisitFields(created.enrollmentVisit) : null,
-        dispense: (created.enrollmentDispenses || []).map((d) => addLegacyDispenseFields(d, created.enrollmentVisit, created.child)),
+        dispense: (created.enrollmentDispenses || []).map((d) =>
+          addLegacyDispenseFields(d, created.enrollmentVisit, created.child)
+        ),
       });
     } catch (err) {
       console.error(err);
@@ -900,10 +899,6 @@ router.post(
   }
 );
 
-/**
- * 2) Search children (by name, unique number, CWC number, caregiver contacts)
- * GET /api/clinical/children/search?q=
- */
 router.get(
   "/children/search",
   requireAuth,
@@ -956,15 +951,6 @@ router.get(
   }
 );
 
-/**
- * 3) Update child demographic / caregiver details
- * PATCH /api/clinical/children/:childId
- *
- * Safe scope for now:
- *  - synced child details are edited online only
- *  - child remains in the same facility
- *  - if cwcNumber changes, uniqueChildNumber is recalculated
- */
 router.patch(
   "/children/:childId",
   requireAuth,
@@ -1074,10 +1060,7 @@ router.patch(
         program: existing.program,
       });
 
-      if (
-        nextCwcNumber !== existing.cwcNumber ||
-        nextUniqueChildNumber !== existing.uniqueChildNumber
-      ) {
+      if (nextCwcNumber !== existing.cwcNumber || nextUniqueChildNumber !== existing.uniqueChildNumber) {
         const duplicateChild = await prisma.child.findFirst({
           where: {
             id: { not: existing.id },
@@ -1155,10 +1138,6 @@ router.patch(
   }
 );
 
-/**
- * 3) Child summary
- * GET /api/clinical/children/:childId/summary
- */
 router.get(
   "/children/:childId/summary",
   requireAuth,
@@ -1180,10 +1159,6 @@ router.get(
   }
 );
 
-/**
- * 4) Create follow-up visit
- * POST /api/clinical/children/:childId/visits
- */
 router.post(
   "/children/:childId/visits",
   requireAuth,
@@ -1220,9 +1195,7 @@ router.post(
       ) {
         const parsedNext = parseDateOrNull(body.nextAppointmentDate);
         if (!parsedNext) {
-          return res
-            .status(400)
-            .json({ message: "nextAppointmentDate must be a valid date (YYYY-MM-DD)" });
+          return res.status(400).json({ message: "nextAppointmentDate must be a valid date (YYYY-MM-DD)" });
         }
         nextAppointmentDate = parsedNext;
       }
@@ -1387,16 +1360,6 @@ router.post(
   }
 );
 
-/**
- * 5) Dispense sachets (optionally link QR boxUid)
- * POST /api/clinical/children/:childId/dispense
- *
- * Backward compatible request body keys:
- *  - sachetsGiven (old)
- *  - quantitySachets (new)
- *  - childVisitId (old)
- *  - visitId (new)
- */
 router.post(
   "/children/:childId/dispense",
   requireAuth,
@@ -1539,10 +1502,6 @@ router.post(
   }
 );
 
-/**
- * 6) Caregiver profile (show caregiver + children)
- * GET /api/clinical/caregivers/:caregiverId
- */
 router.get(
   "/caregivers/:caregiverId",
   requireAuth,
@@ -1575,12 +1534,6 @@ router.get(
   }
 );
 
-// ---------------- In-depth assessment (Option 1) ----------------
-
-/**
- * 7) Create baseline In-Depth Assessment (one per child)
- * POST /api/clinical/children/:childId/assessment
- */
 router.post(
   "/children/:childId/assessment",
   requireAuth,
@@ -1605,7 +1558,6 @@ router.post(
         });
       }
 
-      // strict date validation if client provides one
       const rawDate = body.assessmentDate ?? body.assessedAt;
       if (rawDate !== undefined && rawDate !== null && String(rawDate).trim() !== "") {
         const parsed = parseDateOrNull(rawDate);
@@ -1642,10 +1594,6 @@ router.post(
   }
 );
 
-/**
- * 8) Get in-depth assessment
- * GET /api/clinical/children/:childId/assessment
- */
 router.get(
   "/children/:childId/assessment",
   requireAuth,
@@ -1673,10 +1621,6 @@ router.get(
   }
 );
 
-/**
- * 9) Update in-depth assessment
- * PUT /api/clinical/children/:childId/assessment
- */
 router.put(
   "/children/:childId/assessment",
   requireAuth,
@@ -1700,15 +1644,16 @@ router.put(
         });
       }
 
-      // Only update date if provided
       let assessmentDate = existing.assessmentDate;
-      if (Object.prototype.hasOwnProperty.call(body, "assessmentDate") || Object.prototype.hasOwnProperty.call(body, "assessedAt")) {
+      if (
+        Object.prototype.hasOwnProperty.call(body, "assessmentDate") ||
+        Object.prototype.hasOwnProperty.call(body, "assessedAt")
+      ) {
         const d = parseDateOrNull(body.assessmentDate ?? body.assessedAt);
         if (!d) return res.status(400).json({ message: "assessmentDate (or assessedAt) must be a valid date (YYYY-MM-DD)" });
         assessmentDate = d;
       }
 
-      // Data update
       let dataObj = existing.data;
       if (Object.prototype.hasOwnProperty.call(body, "data")) {
         if (!isPlainObject(body.data)) {
@@ -1716,7 +1661,6 @@ router.put(
         }
         dataObj = body.data;
       } else {
-        // If they sent fields other than the date, store those as the new data
         const { assessedAt: _a, assessmentDate: _b, ...rest } = body;
         if (Object.keys(rest).length) {
           if (!isPlainObject(rest)) return res.status(400).json({ message: "Assessment data must be an object" });
@@ -1732,7 +1676,7 @@ router.put(
         data: {
           assessmentDate,
           data: dataObj,
-          performedByUserId: req.user.id, // last editor
+          performedByUserId: req.user.id,
           ...quick,
         },
       });
@@ -1904,7 +1848,9 @@ router.get(
           child.enrollmentDate ||
           child.createdAt;
 
-        const latestAppointmentVisit = deriveLatestAppointmentVisit(actualVisits.map((v) => addLegacyVisitFields(v)));
+        const latestAppointmentVisit = deriveLatestAppointmentVisit(
+          actualVisits.map((v) => addLegacyVisitFields(v))
+        );
 
         rows.push({
           activityDate,
