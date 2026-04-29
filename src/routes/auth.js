@@ -118,11 +118,18 @@ router.post("/refresh", async (req, res) => {
     const accessToken = signAccessToken(payload);
     const token = accessToken;
 
+    // Backward-compatible refresh response:
+    // - Old apps can continue using accessToken/token and ignore refreshToken.
+    // - Newer apps can store the rotated refreshToken and stay logged in safely.
+    const refreshToken = signRefreshToken(payload);
+
     return res.json({
       token,
       accessToken,
+      refreshToken,
       tokenType: "Bearer",
       expiresIn: ACCESS_TOKEN_EXPIRES_IN,
+      refreshExpiresIn: REFRESH_TOKEN_EXPIRES_IN,
       user: buildUserResponse(user),
     });
   } catch (err) {
