@@ -682,6 +682,18 @@ router.post(
         enrollmentDate = parsed;
       }
 
+      const today = startOfDay(new Date());
+      const enrollmentDay = startOfDay(enrollmentDate);
+      const dobDay = startOfDay(dob);
+
+      if (enrollmentDay > today) {
+        return res.status(400).json({ message: "enrollmentDate cannot be in the future" });
+      }
+
+      if (enrollmentDay < dobDay) {
+        return res.status(400).json({ message: "enrollmentDate cannot be before dateOfBirth" });
+      }
+
       const ageMonthsAtEnrollment = computeAgeInMonths(dob, enrollmentDate);
       if (ageMonthsAtEnrollment < 6 || ageMonthsAtEnrollment > 23) {
         return res.status(400).json({
@@ -1204,6 +1216,10 @@ router.post(
           return res.status(400).json({ message: "visitDate must be a valid date (YYYY-MM-DD)" });
         }
         visitDate = parsed;
+      }
+
+      if (startOfDay(visitDate) < startOfDay(childCheck.enrollmentDate)) {
+        return res.status(400).json({ message: "visitDate cannot be before the child's enrollmentDate" });
       }
 
       const weightKg = toNumberOrNull(body.weightKg ?? body.weight);
