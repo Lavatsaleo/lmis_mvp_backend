@@ -751,6 +751,19 @@ router.post(
           return res.status(400).json({ message: "visit.sachetsDispensed must be a positive number" });
         }
 
+        let visitDate = null;
+        if (
+          v.visitDate !== undefined &&
+          v.visitDate !== null &&
+          String(v.visitDate).trim() !== ""
+        ) {
+          const parsedVisit = parseDateOrNull(v.visitDate);
+          if (!parsedVisit) {
+            return res.status(400).json({ message: "visit.visitDate must be a valid date (YYYY-MM-DD)" });
+          }
+          visitDate = parsedVisit;
+        }
+
         let nextAppointmentDate = null;
         if (
           v.nextAppointmentDate !== undefined &&
@@ -764,10 +777,24 @@ router.post(
           nextAppointmentDate = parsedNext;
         }
 
+        const weightKg = toNumberOrNull(v.weightKg ?? v.weight);
+        const heightCm = toNumberOrNull(v.heightCm ?? v.height ?? v.lengthCm);
+        const muacRaw = toNumberOrNull(v.muacMm ?? v.muac ?? v.muacCm);
+        let muacMm = null;
+        if (Number.isFinite(muacRaw)) {
+          muacMm = muacRaw > 0 && muacRaw < 50 ? Math.round(muacRaw * 10) : Math.round(muacRaw);
+        }
+        const whzScore = toNumberOrNull(v.whzScore ?? v.whz);
+
         enrollmentVisitInput = {
           sachetsDispensed: Math.round(sachets),
+          visitDate,
           nextAppointmentDate,
           notes: v.notes ? String(v.notes) : null,
+          weightKg: Number.isFinite(weightKg) ? weightKg : null,
+          heightCm: Number.isFinite(heightCm) ? heightCm : null,
+          muacMm,
+          whzScore: Number.isFinite(whzScore) ? whzScore : null,
         };
       }
 
@@ -852,13 +879,13 @@ router.post(
               childId: child.id,
               facilityId: facility.id,
               performedByUserId: req.user.id,
-              visitDate: baselineAssessmentInput?.assessmentDate ?? enrollmentDate,
+              visitDate: enrollmentVisitInput.visitDate ?? baselineAssessmentInput?.assessmentDate ?? enrollmentDate,
               nextAppointmentDate: enrollmentVisitInput.nextAppointmentDate,
               notes: enrollmentVisitInput.notes ?? "Enrollment dispense",
-              weightKg: baselineVisitMetrics.weightKg ?? null,
-              heightCm: baselineVisitMetrics.heightCm ?? null,
-              muacMm: baselineVisitMetrics.muacMm ?? null,
-              whzScore: baselineVisitMetrics.whzScore ?? null,
+              weightKg: enrollmentVisitInput.weightKg ?? baselineVisitMetrics.weightKg ?? null,
+              heightCm: enrollmentVisitInput.heightCm ?? baselineVisitMetrics.heightCm ?? null,
+              muacMm: enrollmentVisitInput.muacMm ?? baselineVisitMetrics.muacMm ?? null,
+              whzScore: enrollmentVisitInput.whzScore ?? baselineVisitMetrics.whzScore ?? null,
             },
           });
 

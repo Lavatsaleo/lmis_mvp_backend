@@ -6,34 +6,11 @@ async function requireAuth(req, res, next) {
     const header = req.headers.authorization || "";
     const [type, token] = header.split(" ");
 
-    console.log("AUTH DEBUG INCOMING", {
-      method: req.method,
-      path: req.originalUrl,
-      hasAuthorizationHeader: !!header,
-      authType: type || null,
-      tokenPresent: !!token,
-      tokenPreview: token ? `${token.slice(0, 12)}...${token.slice(-8)}` : null,
-    });
-
     if (type !== "Bearer" || !token) {
-      console.log("AUTH DEBUG REJECTED", {
-        reason: "Missing or invalid Authorization header",
-        method: req.method,
-        path: req.originalUrl,
-        rawAuthorizationHeader: header || null,
-      });
       return res.status(401).json({ message: "Missing or invalid Authorization header" });
     }
 
     const decoded = verifyAccessToken(token);
-
-    console.log("AUTH DEBUG TOKEN OK", {
-      method: req.method,
-      path: req.originalUrl,
-      userIdFromToken: decoded.userId,
-      roleFromToken: decoded.role,
-      facilityIdFromToken: decoded.facilityId || null,
-    });
 
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
@@ -47,12 +24,6 @@ async function requireAuth(req, res, next) {
     });
 
     if (!user || !user.isActive) {
-      console.log("AUTH DEBUG REJECTED", {
-        reason: "User not found or disabled",
-        method: req.method,
-        path: req.originalUrl,
-        decodedUserId: decoded.userId,
-      });
       return res.status(401).json({ message: "User not found or disabled" });
     }
 
@@ -90,7 +61,7 @@ async function requireAuth(req, res, next) {
 
     next();
   } catch (err) {
-    console.log("AUTH DEBUG VERIFY FAILED", {
+    console.warn("AUTH VERIFY FAILED", {
       method: req.method,
       path: req.originalUrl,
       error: String(err.message || err),
