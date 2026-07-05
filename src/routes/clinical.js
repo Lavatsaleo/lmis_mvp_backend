@@ -1702,6 +1702,12 @@ router.post(
           },
         });
 
+        // Bump child.updatedAt so facility delta sync pulls this child/visit to other phones.
+        await tx.child.update({
+          where: { id: childCheck.id },
+          data: { updatedAt: new Date() },
+        });
+
         const createdDispenses = [];
 
         for (const item of dispenseItems) {
@@ -1932,6 +1938,12 @@ router.patch(
           },
         });
 
+        // Bump child.updatedAt so edited visits are visible to other devices via delta sync.
+        await tx.child.update({
+          where: { id: childCheck.id },
+          data: { updatedAt: new Date() },
+        });
+
         let dispenses = latestVisit.dispenses || [];
         let reversedDispenses = [];
         if (newQuantitySachets !== null) {
@@ -2023,6 +2035,10 @@ router.post(
               notes: "Auto-created visit for dispensing",
             },
           });
+          await prisma.child.update({
+            where: { id: childCheck.id },
+            data: { updatedAt: new Date() },
+          });
         }
       }
 
@@ -2035,6 +2051,10 @@ router.post(
             visitId: visit.id,
             quantitySachets: Math.round(quantitySachets),
             note,
+          });
+          await tx.child.update({
+            where: { id: childCheck.id },
+            data: { updatedAt: new Date() },
           });
           return auto.map((a) => a.dispense);
         });
@@ -2095,6 +2115,11 @@ router.post(
             fromFacilityId: childCheck.facilityId,
             note: `Dispensed ${Math.round(quantitySachets)} sachets to child ${childCheck.uniqueChildNumber} (visit ${visit.id}). Remaining: ${newRemaining}`,
           },
+        });
+
+        await tx.child.update({
+          where: { id: childCheck.id },
+          data: { updatedAt: new Date() },
         });
 
         return d;
@@ -2502,6 +2527,102 @@ router.get(
         date: target ? formatDateOnly(target) : null,
         count: rows.length > take ? take : rows.length,
         rows: rows.slice(0, take),
+      });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+    }
+  }
+);
+
+
+router.get(
+  "/facility/sync-delta",
+  requireAuth,
+  requireRole("SUPER_ADMIN", "CLINICIAN", "FACILITY_OFFICER", "VIEWER"),
+  async (req, res) => {
+    try {
+      const facility = await resolveFacilityForClinical(req, req.query || {});
+      if (!facility) {
+        return res.status(400).json({ message: "Your user has no facility assigned" });
+      }
+
+      const serverTime = new Date();
+      const takeRaw = Number(req.query.take || 500);
+      const take = Number.isFinite(takeRaw) ? Math.max(1, Math.min(1000, Math.round(takeRaw))) : 500;
+
+      let since = null;
+      if (req.query.since !== undefined && req.query.since !== null && String(req.query.since).trim() !== "") {
+        since = parseDateOrNull(req.query.since);
+        if (!since) {
+          return res.status(400).json({ message: "since must be a valid ISO date/time" });
+        }
+      }
+
+      const where = { facilityId: facility.id };
+
+      if (since) {
+        const changedVisitChildIds = await prisma.childVisit.findMany({
+          where: {
+            facilityId: facility.id,
+            OR: [
+              { createdAt: { gt: since } },
+              { visitDate: { gt: since } },
+            ],
+          },
+          select: { childId: true },
+          distinct: ["childId"],
+          take,
+        });
+
+        const changedAssessmentChildIds = await prisma.inDepthAssessment.findMany({
+          where: {
+            facilityId: facility.id,
+            OR: [
+              { createdAt: { gt: since } },
+              { updatedAt: { gt: since } },
+              { assessmentDate: { gt: since } },
+            ],
+          },
+          select: { childId: true },
+          distinct: ["childId"],
+          take,
+        });
+
+        const changedChildIds = [
+          ...changedVisitChildIds.map((v) => v.childId),
+          ...changedAssessmentChildIds.map((a) => a.childId),
+        ];
+
+        where.OR = [
+          { updatedAt: { gt: since } },
+          { createdAt: { gt: since } },
+        ];
+
+        if (changedChildIds.length) {
+          where.OR.push({ id: { in: Array.from(new Set(changedChildIds)) } });
+        }
+      }
+
+      const changedChildren = await prisma.child.findMany({
+        where,
+        select: { id: true, updatedAt: true, createdAt: true },
+        orderBy: { updatedAt: "desc" },
+        take,
+      });
+
+      const children = [];
+      for (const row of changedChildren) {
+        const summary = await buildChildSummaryPayload(row.id);
+        if (summary) children.push(summary);
+      }
+
+      return res.json({
+        facility: { id: facility.id, code: facility.code, name: facility.name },
+        since: since ? since.toISOString() : null,
+        serverTime: serverTime.toISOString(),
+        count: children.length,
+        children,
       });
     } catch (err) {
       console.error(err);
