@@ -1663,4 +1663,272 @@ router.get("/reports/honoured-follow-ups", requireAuth, async (req, res) => {
   }
 });
 
+
+// -----------------------------------------------------------------------------
+// Duplicate review queue
+// Mobile users continue service delivery. These dashboard endpoints let reviewers
+// inspect and resolve possible duplicate children later.
+// -----------------------------------------------------------------------------
+function canReviewDuplicateCases(req) {
+  const role = String(req.user?.role || "").toUpperCase();
+  return [
+    "SUPER_ADMIN",
+    "VIEWER",
+    "WAREHOUSE_OFFICER",
+    "FACILITY_OFFICER",
+    "CLINICIAN",
+  ].includes(role);
+}
+
+function duplicateCaseScopeWhere(scope) {
+  if (!scope || scope.mode === "ALL") return {};
+  const ids = Array.isArray(scope.facilityIdsFacilitiesOnly)
+    ? scope.facilityIdsFacilitiesOnly.filter(Boolean)
+    : [];
+  if (!ids.length) return { id: "__none__" };
+  return {
+    OR: [
+      { facilityId: { in: ids } },
+      { matchingFacilityId: { in: ids } },
+    ],
+  };
+}
+
+function normalizeDuplicateStatusFilter(value) {
+  const s = String(value || "").trim().toUpperCase();
+  if (!s || s === "ALL") return null;
+  return s;
+}
+
+function mapDuplicateResolutionActionToStatus(action) {
+  const a = String(action || "").trim().toUpperCase();
+  if (a === "NOT_DUPLICATE" || a === "RESOLVED_NOT_DUPLICATE") return "RESOLVED_NOT_DUPLICATE";
+  if (a === "DUPLICATE" || a === "RESOLVED_DUPLICATE") return "RESOLVED_DUPLICATE";
+  if (a === "TRANSFER" || a === "TRANSFER_APPROVED") return "TRANSFER_APPROVED";
+  if (a === "MERGE" || a === "MERGED") return "MERGED";
+  if (a === "CLOSE" || a === "CLOSED") return "CLOSED";
+  if (a === "UNDER_REVIEW" || a === "KEEP_UNDER_REVIEW") return "UNDER_REVIEW";
+  return null;
+}
+
+function summarizeDuplicateChild(child) {
+  if (!child) return null;
+  const visits = Array.isArray(child.visits) ? child.visits : [];
+  const lastVisit = visits[0] || null;
+  const lastSachetsDispensed = lastVisit && Array.isArray(lastVisit.dispenses)
+    ? lastVisit.dispenses.reduce((sum, d) => sum + Number(d.quantitySachets || 0), 0)
+    : 0;
+
+  return {
+    id: child.id,
+    uniqueChildNumber: child.uniqueChildNumber,
+    cwcNumber: child.cwcNumber,
+    firstName: child.firstName,
+    lastName: child.lastName,
+    childName: `${child.firstName || ""} ${child.lastName || ""}`.trim(),
+    sex: child.sex,
+    dateOfBirth: child.dateOfBirth,
+    enrollmentDate: child.enrollmentDate,
+    caregiver: child.caregiver
+      ? {
+          id: child.caregiver.id,
+          fullName: child.caregiver.fullName,
+          contacts: child.caregiver.contacts,
+          village: child.caregiver.village,
+        }
+      : null,
+    facility: child.facility
+      ? {
+          id: child.facility.id,
+          code: child.facility.code,
+          name: child.facility.name,
+        }
+      : null,
+    lastVisit: lastVisit
+      ? {
+          id: lastVisit.id,
+          visitDate: lastVisit.visitDate,
+          weightKg: lastVisit.weightKg,
+          heightCm: lastVisit.heightCm,
+          muacMm: lastVisit.muacMm,
+          whzScore: lastVisit.whzScore,
+          nextAppointmentDate: lastVisit.nextAppointmentDate,
+          sachetsDispensed: lastSachetsDispensed,
+        }
+      : null,
+  };
+}
+
+async function enrichDuplicateCases(cases) {
+  const childIds = [
+    ...new Set(
+      cases
+        .flatMap((c) => [c.primaryChildId, c.duplicateChildId])
+        .filter(Boolean)
+    ),
+  ];
+
+  const facilityIds = [
+    ...new Set(
+      cases
+        .flatMap((c) => [c.facilityId, c.matchingFacilityId])
+        .filter(Boolean)
+    ),
+  ];
+
+  const [children, facilities, users] = await Promise.all([
+    childIds.length
+      ? prisma.child.findMany({
+          where: { id: { in: childIds } },
+          include: {
+            caregiver: true,
+            facility: true,
+            visits: {
+              orderBy: { visitDate: "desc" },
+              take: 1,
+              include: { dispenses: true },
+            },
+          },
+        })
+      : [],
+    facilityIds.length
+      ? prisma.facility.findMany({
+          where: { id: { in: facilityIds } },
+          select: { id: true, code: true, name: true, type: true },
+        })
+      : [],
+    cases.some((c) => c.createdByUserId || c.resolvedByUserId)
+      ? prisma.user.findMany({
+          where: {
+            id: {
+              in: [
+                ...new Set(
+                  cases
+                    .flatMap((c) => [c.createdByUserId, c.resolvedByUserId])
+                    .filter(Boolean)
+                ),
+              ],
+            },
+          },
+          select: { id: true, fullName: true, email: true, role: true },
+        })
+      : [],
+  ]);
+
+  const childMap = new Map(children.map((c) => [c.id, c]));
+  const facilityMap = new Map(facilities.map((f) => [f.id, f]));
+  const userMap = new Map(users.map((u) => [u.id, u]));
+
+  return cases.map((c) => ({
+    ...c,
+    primaryChild: summarizeDuplicateChild(childMap.get(c.primaryChildId)),
+    duplicateChild: summarizeDuplicateChild(childMap.get(c.duplicateChildId)),
+    facility: c.facilityId ? facilityMap.get(c.facilityId) || null : null,
+    matchingFacility: c.matchingFacilityId ? facilityMap.get(c.matchingFacilityId) || null : null,
+    createdBy: c.createdByUserId ? userMap.get(c.createdByUserId) || null : null,
+    resolvedBy: c.resolvedByUserId ? userMap.get(c.resolvedByUserId) || null : null,
+  }));
+}
+
+router.get("/duplicate-cases", requireAuth, async (req, res) => {
+  try {
+    if (!canReviewDuplicateCases(req)) return res.status(403).json({ message: "Forbidden" });
+
+    const take = Math.min(200, Math.max(1, toInt(req.query.take, 50)));
+    const skip = Math.max(0, toInt(req.query.skip, 0));
+    const status = normalizeDuplicateStatusFilter(req.query.status || "OPEN");
+    const q = String(req.query.q || "").trim();
+
+    const scope = await getScope(req);
+    const filters = [];
+    const scopedWhere = duplicateCaseScopeWhere(scope);
+    if (Object.keys(scopedWhere).length) filters.push(scopedWhere);
+    if (status) filters.push({ status });
+
+    if (q) {
+      filters.push({
+        OR: [
+          { primaryChildId: { contains: q } },
+          { duplicateChildId: { contains: q } },
+          { mobileDecision: { contains: q } },
+          { source: { contains: q } },
+        ],
+      });
+    }
+
+    const where = filters.length ? { AND: filters } : {};
+
+    const [total, cases] = await Promise.all([
+      prisma.duplicateCase.count({ where }),
+      prisma.duplicateCase.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        skip,
+        take,
+      }),
+    ]);
+
+    const rows = await enrichDuplicateCases(cases);
+    return res.json({ total, take, skip, rows, filters: { status, q } });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
+router.get("/duplicate-cases/:id", requireAuth, async (req, res) => {
+  try {
+    if (!canReviewDuplicateCases(req)) return res.status(403).json({ message: "Forbidden" });
+
+    const scope = await getScope(req);
+    const where = { id: req.params.id, ...duplicateCaseScopeWhere(scope) };
+    const record = await prisma.duplicateCase.findFirst({ where });
+    if (!record) return res.status(404).json({ message: "Duplicate case not found" });
+
+    const rows = await enrichDuplicateCases([record]);
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
+router.patch("/duplicate-cases/:id/resolve", requireAuth, async (req, res) => {
+  try {
+    if (!canReviewDuplicateCases(req)) return res.status(403).json({ message: "Forbidden" });
+
+    const action = req.body?.action || req.body?.resolutionAction;
+    const nextStatus = mapDuplicateResolutionActionToStatus(action);
+    if (!nextStatus) {
+      return res.status(400).json({
+        message: "Invalid action. Use NOT_DUPLICATE, DUPLICATE, TRANSFER, MERGE, UNDER_REVIEW, or CLOSE.",
+      });
+    }
+
+    const scope = await getScope(req);
+    const existing = await prisma.duplicateCase.findFirst({
+      where: { id: req.params.id, ...duplicateCaseScopeWhere(scope) },
+    });
+    if (!existing) return res.status(404).json({ message: "Duplicate case not found" });
+
+    const note = req.body?.note ?? req.body?.resolutionNote;
+    const updated = await prisma.duplicateCase.update({
+      where: { id: existing.id },
+      data: {
+        status: nextStatus,
+        resolutionAction: String(action || "").trim().toUpperCase(),
+        resolutionNote: note ? String(note).trim() : null,
+        resolvedByUserId: nextStatus === "UNDER_REVIEW" ? null : req.user.id,
+        resolvedAt: nextStatus === "UNDER_REVIEW" ? null : new Date(),
+      },
+    });
+
+    const rows = await enrichDuplicateCases([updated]);
+    return res.json({ message: "Duplicate case updated", case: rows[0] });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
 module.exports = router;

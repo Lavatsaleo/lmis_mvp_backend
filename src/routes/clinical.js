@@ -80,6 +80,308 @@ function compareDescByDate(a, b) {
   return tb - ta;
 }
 
+function normalizeDuplicateText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeDuplicatePhone(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function maskedPhone(value) {
+  const digits = normalizeDuplicatePhone(value);
+  if (!digits) return null;
+  if (digits.length <= 3) return `***${digits}`;
+  return `***${digits.slice(-3)}`;
+}
+
+function sameDateOnly(a, b) {
+  const fa = formatDateOnly(a);
+  const fb = formatDateOnly(b);
+  return !!fa && !!fb && fa === fb;
+}
+
+function calculateDuplicateScore(input, child, activeFacilityId) {
+  const reasons = [];
+  let score = 0;
+
+  const cwcIn = normalizeDuplicateText(input.cwcNumber);
+  const cwcChild = normalizeDuplicateText(child.cwcNumber);
+  if (cwcIn && cwcChild && cwcIn === cwcChild) {
+    score += 55;
+    reasons.push("Same CWC number");
+  }
+
+  const phoneIn = normalizeDuplicatePhone(input.caregiverContacts);
+  const phoneChild = normalizeDuplicatePhone(child.caregiver?.contacts);
+  if (phoneIn && phoneChild && phoneIn === phoneChild) {
+    score += 25;
+    reasons.push("Same caregiver phone");
+  }
+
+  if (input.dateOfBirth && sameDateOnly(input.dateOfBirth, child.dateOfBirth)) {
+    score += 20;
+    reasons.push("Same date of birth");
+  }
+
+  const sexIn = normalizeDuplicateText(input.sex);
+  const sexChild = normalizeDuplicateText(child.sex);
+  if (sexIn && sexChild && sexIn === sexChild) {
+    score += 10;
+    reasons.push("Same sex");
+  }
+
+  const firstIn = normalizeDuplicateText(input.firstName);
+  const firstChild = normalizeDuplicateText(child.firstName);
+  if (firstIn && firstChild) {
+    if (firstIn === firstChild) {
+      score += 10;
+      reasons.push("Same first name");
+    } else if (firstChild.includes(firstIn) || firstIn.includes(firstChild)) {
+      score += 5;
+      reasons.push("Similar first name");
+    }
+  }
+
+  const lastIn = normalizeDuplicateText(input.lastName);
+  const lastChild = normalizeDuplicateText(child.lastName);
+  if (lastIn && lastChild) {
+    if (lastIn === lastChild) {
+      score += 10;
+      reasons.push("Same last name");
+    } else if (lastChild.includes(lastIn) || lastIn.includes(lastChild)) {
+      score += 5;
+      reasons.push("Similar last name");
+    }
+  }
+
+  const caregiverIn = normalizeDuplicateText(input.caregiverName);
+  const caregiverChild = normalizeDuplicateText(child.caregiver?.fullName);
+  if (caregiverIn && caregiverChild) {
+    if (caregiverIn === caregiverChild) {
+      score += 12;
+      reasons.push("Same caregiver name");
+    } else if (caregiverChild.includes(caregiverIn) || caregiverIn.includes(caregiverChild)) {
+      score += 6;
+      reasons.push("Similar caregiver name");
+    }
+  }
+
+  const villageIn = normalizeDuplicateText(input.village);
+  const villageChild = normalizeDuplicateText(child.caregiver?.village);
+  if (villageIn && villageChild && villageIn === villageChild) {
+    score += 5;
+    reasons.push("Same village/location");
+  }
+
+  const sameFacility = !!activeFacilityId && child.facilityId === activeFacilityId;
+  return { score, reasons, sameFacility };
+}
+
+
+function duplicateInputFromEnrollmentBody(body = {}) {
+  return {
+    cwcNumber: String(body.cwcNumber || "").trim(),
+    firstName: String(body.childFirstName ?? body.firstName ?? "").trim(),
+    lastName: String(body.childLastName ?? body.lastName ?? "").trim(),
+    dateOfBirth: String(body.dateOfBirth || "").trim(),
+    sex: String(body.sex || "").trim(),
+    caregiverName: String(body.caregiverName ?? body.fullName ?? "").trim(),
+    caregiverContacts: String(body.caregiverContacts ?? body.contacts ?? "").trim(),
+    village: String(body.village || "").trim(),
+  };
+}
+
+function compactDuplicateCandidate(child, input, activeFacilityId) {
+  const scored = calculateDuplicateScore(input, child, activeFacilityId);
+  const lastVisit = Array.isArray(child.visits) && child.visits.length ? child.visits[0] : null;
+  const lastSachetsDispensed = lastVisit ? sumVisitSachets(lastVisit) : 0;
+
+  return {
+    childId: child.id,
+    uniqueChildNumber: child.uniqueChildNumber,
+    cwcNumber: child.cwcNumber,
+    childName: `${child.firstName || ""} ${child.lastName || ""}`.trim(),
+    firstName: child.firstName,
+    lastName: child.lastName,
+    sex: child.sex,
+    dateOfBirth: formatDateOnly(child.dateOfBirth),
+    caregiverName: child.caregiver?.fullName || null,
+    caregiverContactsMasked: maskedPhone(child.caregiver?.contacts),
+    village: child.caregiver?.village || null,
+    facilityId: child.facilityId,
+    facilityCode: child.facility?.code || null,
+    facilityName: child.facility?.name || null,
+    sameFacility: scored.sameFacility,
+    lastVisitDate: lastVisit ? formatDateOnly(lastVisit.visitDate) : null,
+    lastSachetsDispensed,
+    score: scored.score,
+    reasons: scored.reasons,
+  };
+}
+
+async function findDuplicateCandidates(client, input, activeFacilityId, options = {}) {
+  const excludeChildId = options.excludeChildId ? String(options.excludeChildId) : null;
+  const minimumScore = Number.isFinite(Number(options.minimumScore)) ? Number(options.minimumScore) : 25;
+
+  const hasAnyUsefulInput = Object.values(input || {}).some((v) => String(v || "").trim() !== "");
+  if (!hasAnyUsefulInput) return [];
+
+  const or = [];
+
+  if (input.cwcNumber) {
+    or.push({ cwcNumber: input.cwcNumber });
+    or.push({ uniqueChildNumber: { contains: input.cwcNumber } });
+  }
+
+  if (input.firstName) or.push({ firstName: { contains: input.firstName } });
+  if (input.lastName) or.push({ lastName: { contains: input.lastName } });
+  if (input.caregiverName) or.push({ caregiver: { fullName: { contains: input.caregiverName } } });
+  if (input.caregiverContacts) or.push({ caregiver: { contacts: { contains: input.caregiverContacts } } });
+
+  const dob = normalizeDateOnly(input.dateOfBirth);
+  if (dob) {
+    const dobEnd = new Date(dob);
+    dobEnd.setDate(dobEnd.getDate() + 1);
+    or.push({ dateOfBirth: { gte: dob, lt: dobEnd } });
+  }
+
+  if (or.length === 0) return [];
+
+  const where = { OR: or };
+  if (excludeChildId) where.id = { not: excludeChildId };
+
+  const children = await client.child.findMany({
+    where,
+    include: {
+      caregiver: true,
+      facility: true,
+      visits: {
+        orderBy: { visitDate: "desc" },
+        take: 1,
+        include: { dispenses: true },
+      },
+    },
+    orderBy: { updatedAt: "desc" },
+    take: 100,
+  });
+
+  return children
+    .map((child) => compactDuplicateCandidate(child, input, activeFacilityId))
+    .filter((m) => m.score >= minimumScore || (m.reasons || []).includes("Same CWC number"))
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return String(a.childName || "").localeCompare(String(b.childName || ""));
+    })
+    .slice(0, 10);
+}
+
+function normalizeMobileDuplicateDecision(duplicateReview) {
+  const status = String(duplicateReview?.status || "").trim().toUpperCase();
+  const decision = String(duplicateReview?.userDecision || "").trim().toUpperCase();
+
+  if (decision === "SAME_CHILD") return "SAME_CHILD";
+  if (decision === "DIFFERENT_CHILD") return "DIFFERENT_CHILD";
+  if (decision === "NOT_SURE") return "NOT_SURE";
+  if (status === "PENDING_SERVER_CHECK") return "PENDING_SERVER_CHECK";
+  if (status === "CHECKED_NO_MATCH") return "CHECKED_NO_MATCH";
+  if (status === "POSSIBLE_DUPLICATE_REVIEWED_ON_MOBILE") return "NOT_SURE";
+  return status || "UNKNOWN";
+}
+
+async function createDuplicateCasesForEnrollment(tx, {
+  child,
+  facility,
+  performedByUserId,
+  enrollmentBody,
+}) {
+  const duplicateReview = isPlainObject(enrollmentBody?.duplicateReview)
+    ? enrollmentBody.duplicateReview
+    : null;
+
+  const input = duplicateInputFromEnrollmentBody(enrollmentBody || {});
+  const mobileDecision = normalizeMobileDuplicateDecision(duplicateReview);
+
+  let matches = await findDuplicateCandidates(tx, input, facility?.id, {
+    excludeChildId: child.id,
+    minimumScore: 25,
+  });
+
+  // If the mobile app had already shown a candidate but the server-side search
+  // does not currently return it, keep the mobile audit trail by creating a case
+  // from the saved topCandidate/candidateIds.
+  if (matches.length === 0 && duplicateReview) {
+    const topCandidate = isPlainObject(duplicateReview.topCandidate)
+      ? duplicateReview.topCandidate
+      : null;
+    const candidateIds = Array.isArray(duplicateReview.candidateIds)
+      ? duplicateReview.candidateIds.map((x) => String(x)).filter(Boolean)
+      : [];
+
+    if (topCandidate?.childId || candidateIds.length || mobileDecision === "PENDING_SERVER_CHECK") {
+      matches = [
+        {
+          childId: topCandidate?.childId || candidateIds[0] || null,
+          facilityId: null,
+          score: Number.isFinite(Number(topCandidate?.score)) ? Math.round(Number(topCandidate.score)) : null,
+          reasons: Array.isArray(topCandidate?.reasons) ? topCandidate.reasons : ["Mobile duplicate review saved"],
+          ...topCandidate,
+        },
+      ];
+    }
+  }
+
+  if (matches.length === 0 || mobileDecision === "CHECKED_NO_MATCH") {
+    return [];
+  }
+
+  const created = [];
+  for (const match of matches.slice(0, 5)) {
+    const duplicateChildId = match.childId ? String(match.childId) : null;
+
+    // Avoid creating repeated open cases for the same pair/source.
+    const existing = duplicateChildId
+      ? await tx.duplicateCase.findFirst({
+          where: {
+            primaryChildId: child.id,
+            duplicateChildId,
+            source: "MOBILE_ENROLLMENT",
+            status: { in: ["OPEN", "UNDER_REVIEW"] },
+          },
+        })
+      : null;
+
+    if (existing) {
+      created.push(existing);
+      continue;
+    }
+
+    const c = await tx.duplicateCase.create({
+      data: {
+        primaryChildId: child.id,
+        duplicateChildId,
+        facilityId: child.facilityId || facility?.id || null,
+        matchingFacilityId: match.facilityId || null,
+        source: duplicateReview ? "MOBILE_ENROLLMENT" : "SERVER_SYNC_VALIDATION",
+        status: "OPEN",
+        mobileDecision,
+        matchScore: Number.isFinite(Number(match.score)) ? Math.round(Number(match.score)) : null,
+        matchReasons: Array.isArray(match.reasons) ? match.reasons : [],
+        topCandidate: match,
+        candidateIds: matches.map((m) => m.childId).filter(Boolean),
+        payload: duplicateReview || { status: "SERVER_CHECK_CREATED_CASE" },
+        createdByUserId: performedByUserId || null,
+      },
+    });
+    created.push(c);
+  }
+
+  return created;
+}
+
 function normalizeAssessmentType(v) {
   const s = String(v || "").trim().toUpperCase();
   if (!s) return null;
@@ -608,6 +910,7 @@ async function buildChildSummaryPayload(childId) {
     where: { id: childId },
     include: {
       caregiver: true,
+      facility: true,
       inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
       visits: {
         orderBy: { visitDate: "desc" },
@@ -960,7 +1263,14 @@ router.post(
           enrollmentDispenses = auto.map((a) => a.dispense);
         }
 
-        return { caregiver, child, assessment, enrollmentVisit, enrollmentDispenses };
+        const duplicateCases = await createDuplicateCasesForEnrollment(tx, {
+          child,
+          facility,
+          performedByUserId: req.user.id,
+          enrollmentBody: body,
+        });
+
+        return { caregiver, child, assessment, enrollmentVisit, enrollmentDispenses, duplicateCases };
       });
 
       return res.status(201).json({
@@ -973,6 +1283,16 @@ router.post(
         dispense: (created.enrollmentDispenses || []).map((d) =>
           addLegacyDispenseFields(d, created.enrollmentVisit, created.child)
         ),
+        duplicateReview: {
+          caseCount: Array.isArray(created.duplicateCases) ? created.duplicateCases.length : 0,
+          cases: (created.duplicateCases || []).map((c) => ({
+            id: c.id,
+            status: c.status,
+            mobileDecision: c.mobileDecision,
+            duplicateChildId: c.duplicateChildId,
+            matchScore: c.matchScore,
+          })),
+        },
       });
     } catch (err) {
       console.error(err);
@@ -981,6 +1301,42 @@ router.post(
       if (err.meta) payload.meta = err.meta;
       if (status === 500) payload.error = String(err.message || err);
       return res.status(status).json(payload);
+    }
+  }
+);
+
+
+router.get(
+  "/children/duplicate-check",
+  requireAuth,
+  requireRole("SUPER_ADMIN", "CLINICIAN", "FACILITY_OFFICER", "VIEWER"),
+  async (req, res) => {
+    try {
+      const input = {
+        cwcNumber: String(req.query.cwcNumber || "").trim(),
+        firstName: String(req.query.firstName || "").trim(),
+        lastName: String(req.query.lastName || "").trim(),
+        dateOfBirth: String(req.query.dateOfBirth || "").trim(),
+        sex: String(req.query.sex || "").trim(),
+        caregiverName: String(req.query.caregiverName || "").trim(),
+        caregiverContacts: String(req.query.caregiverContacts || "").trim(),
+        village: String(req.query.village || "").trim(),
+      };
+
+      const activeFacility = await resolveFacilityForClinical(req, req.query || {});
+      const matches = await findDuplicateCandidates(prisma, input, activeFacility?.id, {
+        minimumScore: 25,
+      });
+
+      return res.json({
+        matches,
+        currentFacility: activeFacility
+          ? { id: activeFacility.id, code: activeFacility.code, name: activeFacility.name }
+          : null,
+      });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Server error", error: String(err.message || err) });
     }
   }
 );
@@ -1016,7 +1372,7 @@ router.get(
 
       const children = await prisma.child.findMany({
         where,
-        include: { caregiver: true },
+        include: { caregiver: true, facility: true },
         take: 50,
         orderBy: { createdAt: "desc" },
       });
@@ -1025,6 +1381,8 @@ router.get(
         ...addLegacyChildFields({
           ...c,
           caregiver: addLegacyCaregiverFields(c.caregiver),
+          facility: c.facility ? { id: c.facility.id, code: c.facility.code, name: c.facility.name } : null,
+          facilityCode: c.facility?.code,
         }),
         ageInMonths: computeAgeInMonths(c.dateOfBirth),
       }));
@@ -1965,6 +2323,7 @@ router.get(
         where: { facilityId: facility.id },
         include: {
           caregiver: true,
+          facility: true,
           inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
           visits: {
             orderBy: { visitDate: "desc" },
@@ -2019,6 +2378,8 @@ router.get(
             cwcNumber: child.cwcNumber,
             enrollmentDate: child.enrollmentDate,
             caregiver: addLegacyCaregiverFields(child.caregiver),
+            facility: child.facility ? { id: child.facility.id, code: child.facility.code, name: child.facility.name } : null,
+            facilityCode: child.facility?.code,
           },
           latestAppointmentVisit,
           latestVisit: visits[0] || null,
@@ -2057,7 +2418,7 @@ router.get(
       }
 
       const takeRaw = Number(req.query.take || 50);
-      const take = Number.isFinite(takeRaw) ? Math.max(1, Math.min(200, Math.round(takeRaw))) : 50;
+      const take = Number.isFinite(takeRaw) ? Math.max(1, Math.min(500, Math.round(takeRaw))) : 50;
 
       const target = req.query.date ? normalizeDateOnly(req.query.date) : null;
       if (req.query.date && !target) {
@@ -2068,6 +2429,7 @@ router.get(
         where: { facilityId: facility.id },
         include: {
           caregiver: true,
+          facility: true,
           visits: {
             orderBy: { visitDate: "desc" },
             include: { dispenses: { orderBy: { createdAt: "desc" } } },
@@ -2120,6 +2482,8 @@ router.get(
             cwcNumber: child.cwcNumber,
             enrollmentDate: child.enrollmentDate,
             caregiver: addLegacyCaregiverFields(child.caregiver),
+            facility: child.facility ? { id: child.facility.id, code: child.facility.code, name: child.facility.name } : null,
+            facilityCode: child.facility?.code,
           },
           visit: matchingVisit ? addLegacyVisitFields(matchingVisit) : null,
           assessment: matchingAssessment ? addLegacyAssessmentFields(matchingAssessment) : null,
