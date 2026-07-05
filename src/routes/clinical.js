@@ -287,6 +287,53 @@ async function autoAllocateDispenseFromFacility(tx, {
   return createdDispenses;
 }
 
+
+async function reverseVisitDispensesToStock(tx, {
+  visit,
+  performedByUserId,
+  reason,
+}) {
+  const dispenses = Array.isArray(visit?.dispenses) ? visit.dispenses : [];
+  const reversed = [];
+
+  for (const d of dispenses) {
+    const qty = Math.round(Number(d?.quantitySachets || 0));
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+
+    if (d.boxId) {
+      const box = await tx.box.findUnique({ where: { id: d.boxId } });
+      if (box) {
+        const perBox = Number.isFinite(box.sachetsPerBox) ? box.sachetsPerBox : 600;
+        const currentRemaining = Number.isFinite(box.sachetsRemaining) ? box.sachetsRemaining : 0;
+        const newRemaining = Math.min(perBox, currentRemaining + qty);
+
+        await tx.box.update({
+          where: { id: box.id },
+          data: {
+            sachetsRemaining: newRemaining,
+            status: "IN_FACILITY",
+          },
+        });
+
+        await tx.boxEvent.create({
+          data: {
+            boxId: box.id,
+            type: "ADJUSTMENT",
+            performedByUserId,
+            toFacilityId: visit.facilityId,
+            note: `Reversed ${qty} sachets from edited visit ${visit.id}. New remaining: ${newRemaining}${reason ? " • " + reason : ""}`,
+          },
+        });
+      }
+    }
+
+    await tx.dispense.delete({ where: { id: d.id } });
+    reversed.push({ id: d.id, quantitySachets: qty, boxId: d.boxId || null });
+  }
+
+  return reversed;
+}
+
 /**
  * Accepts either:
  *  - { assessmentDate/assessedAt, data: {...} }
@@ -1398,6 +1445,172 @@ router.post(
       const payload = { message: status === 500 ? "Server error" : String(err.message || err) };
       if (status === 500) payload.error = String(err.message || err);
       if (err.meta) payload.meta = err.meta;
+      return res.status(status).json(payload);
+    }
+  }
+);
+
+
+router.patch(
+  "/children/:childId/visits/:visitId",
+  requireAuth,
+  requireRole("SUPER_ADMIN", "CLINICIAN"),
+  async (req, res) => {
+    try {
+      const childCheck = await assertChildInMyFacility(req, req.params.childId);
+      if (!childCheck) return res.status(404).json({ message: "Child not found" });
+      if (childCheck === "FORBIDDEN") return res.status(403).json({ message: "Forbidden" });
+
+      const existingVisit = await prisma.childVisit.findUnique({
+        where: { id: req.params.visitId },
+        include: { dispenses: { include: { box: true } } },
+      });
+
+      if (!existingVisit || existingVisit.childId !== childCheck.id || existingVisit.facilityId !== childCheck.facilityId) {
+        return res.status(404).json({ message: "Visit not found for this child" });
+      }
+
+      const body = req.body || {};
+
+      let visitDate = existingVisit.visitDate;
+      if (body.visitDate !== undefined && body.visitDate !== null && String(body.visitDate).trim() !== "") {
+        const parsed = parseDateOrNull(body.visitDate);
+        if (!parsed) {
+          return res.status(400).json({ message: "visitDate must be a valid date (YYYY-MM-DD)" });
+        }
+        visitDate = parsed;
+      }
+
+      if (startOfDay(visitDate) < startOfDay(childCheck.enrollmentDate)) {
+        return res.status(400).json({ message: "visitDate cannot be before the child's enrollmentDate" });
+      }
+
+      if (startOfDay(visitDate) > startOfDay(new Date())) {
+        return res.status(400).json({ message: "visitDate cannot be in the future" });
+      }
+
+      let nextAppointmentDate = existingVisit.nextAppointmentDate;
+      if (Object.prototype.hasOwnProperty.call(body, "nextAppointmentDate")) {
+        nextAppointmentDate = null;
+        if (body.nextAppointmentDate !== null && String(body.nextAppointmentDate).trim() !== "") {
+          const parsedNext = parseDateOrNull(body.nextAppointmentDate);
+          if (!parsedNext) {
+            return res.status(400).json({ message: "nextAppointmentDate must be a valid date (YYYY-MM-DD)" });
+          }
+          nextAppointmentDate = parsedNext;
+        }
+      }
+
+      if (nextAppointmentDate && startOfDay(nextAppointmentDate) < startOfDay(visitDate)) {
+        return res.status(400).json({ message: "nextAppointmentDate cannot be before visitDate" });
+      }
+
+      const sameDayOtherVisit = await findExistingVisitForSameChildAndDay(prisma, {
+        childId: childCheck.id,
+        facilityId: childCheck.facilityId,
+        visitDate,
+      });
+
+      if (sameDayOtherVisit && sameDayOtherVisit.id !== existingVisit.id) {
+        return res.status(409).json({
+          message: `Another visit for this child already exists on ${formatDateOnly(visitDate)}. Choose a different date or edit that visit.`,
+          existingVisit: addLegacyVisitFields(sameDayOtherVisit),
+        });
+      }
+
+      const weightKg = Object.prototype.hasOwnProperty.call(body, "weightKg") || Object.prototype.hasOwnProperty.call(body, "weight")
+        ? toNumberOrNull(body.weightKg ?? body.weight)
+        : existingVisit.weightKg;
+      const heightCm = Object.prototype.hasOwnProperty.call(body, "heightCm") || Object.prototype.hasOwnProperty.call(body, "height")
+        ? toNumberOrNull(body.heightCm ?? body.height)
+        : existingVisit.heightCm;
+      const muacCandidate = Object.prototype.hasOwnProperty.call(body, "muacMm") || Object.prototype.hasOwnProperty.call(body, "muac")
+        ? toNumberOrNull(body.muacMm ?? body.muac)
+        : existingVisit.muacMm;
+      const muacMm = Number.isFinite(muacCandidate) ? Math.round(muacCandidate) : null;
+      const whzScore = Object.prototype.hasOwnProperty.call(body, "whzScore") || Object.prototype.hasOwnProperty.call(body, "whz")
+        ? toNumberOrNull(body.whzScore ?? body.whz)
+        : existingVisit.whzScore;
+      const notes = Object.prototype.hasOwnProperty.call(body, "notes")
+        ? (body.notes ? String(body.notes) : null)
+        : existingVisit.notes;
+
+      let newQuantitySachets = null;
+      if (
+        Object.prototype.hasOwnProperty.call(body, "quantitySachets") ||
+        Object.prototype.hasOwnProperty.call(body, "sachetsDispensed") ||
+        Object.prototype.hasOwnProperty.call(body, "sachetsGiven")
+      ) {
+        const qty = Number(body.quantitySachets ?? body.sachetsDispensed ?? body.sachetsGiven);
+        if (!Number.isFinite(qty) || qty <= 0) {
+          return res.status(400).json({ message: "quantitySachets must be a positive number" });
+        }
+        newQuantitySachets = Math.round(qty);
+      }
+
+      const updated = await prisma.$transaction(async (tx) => {
+        const latestVisit = await tx.childVisit.findUnique({
+          where: { id: existingVisit.id },
+          include: { dispenses: { include: { box: true } } },
+        });
+
+        if (!latestVisit) {
+          const e = new Error("Visit not found for this child");
+          e.statusCode = 404;
+          throw e;
+        }
+
+        const updatedVisit = await tx.childVisit.update({
+          where: { id: latestVisit.id },
+          data: {
+            visitDate,
+            notes,
+            weightKg,
+            heightCm,
+            muacMm,
+            whzScore,
+            nextAppointmentDate,
+            performedByUserId: req.user.id,
+          },
+        });
+
+        let dispenses = latestVisit.dispenses || [];
+        let reversedDispenses = [];
+        if (newQuantitySachets !== null) {
+          reversedDispenses = await reverseVisitDispensesToStock(tx, {
+            visit: latestVisit,
+            performedByUserId: req.user.id,
+            reason: "Visit details edited",
+          });
+
+          const allocated = await autoAllocateDispenseFromFacility(tx, {
+            facilityId: childCheck.facilityId,
+            performedByUserId: req.user.id,
+            childUniqueNumber: childCheck.uniqueChildNumber,
+            visitId: updatedVisit.id,
+            quantitySachets: newQuantitySachets,
+            note: notes || "Edited visit dispense",
+          });
+          dispenses = allocated.map((a) => a.dispense);
+        }
+
+        return { visit: updatedVisit, dispenses, reversedDispenses };
+      });
+
+      const outVisit = addLegacyVisitFields({ ...updated.visit, dispenses: updated.dispenses });
+      const outDispenses = (updated.dispenses || []).map((d) => addLegacyDispenseFields(d, updated.visit, childCheck));
+
+      return res.json({
+        message: "Visit updated",
+        visit: { ...outVisit, dispenses: outDispenses },
+        reversedDispenses: updated.reversedDispenses,
+      });
+    } catch (err) {
+      console.error(err);
+      const status = err.statusCode || 500;
+      const payload = { message: status === 500 ? "Server error" : String(err.message || err) };
+      if (err.meta) payload.meta = err.meta;
+      if (status === 500) payload.error = String(err.message || err);
       return res.status(status).json(payload);
     }
   }
