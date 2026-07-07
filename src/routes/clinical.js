@@ -1421,6 +1421,7 @@ router.patch(
       const lastNameRaw = body.childLastName ?? body.lastName;
       const sexRaw = body.sex;
       const dateOfBirthRaw = body.dateOfBirth;
+      const enrollmentDateRaw = body.enrollmentDate;
       const cwcNumberRaw = body.cwcNumber;
       const chpNameRaw = body.chpName;
       const chpContactsRaw = body.chpContacts;
@@ -1452,6 +1453,12 @@ router.patch(
         const dob = parseDateOrNull(dateOfBirthRaw);
         if (!dob) return res.status(400).json({ message: "dateOfBirth must be a valid date (YYYY-MM-DD)" });
         childData.dateOfBirth = dob;
+      }
+
+      if (enrollmentDateRaw !== undefined) {
+        const enrollmentDate = parseDateOrNull(enrollmentDateRaw);
+        if (!enrollmentDate) return res.status(400).json({ message: "enrollmentDate must be a valid date (YYYY-MM-DD)" });
+        childData.enrollmentDate = enrollmentDate;
       }
 
       let nextCwcNumber = existing.cwcNumber;
@@ -1543,8 +1550,31 @@ router.patch(
         }
       }
 
-      if (Object.prototype.hasOwnProperty.call(childData, "dateOfBirth")) {
-        const ageMonths = computeAgeInMonths(childData.dateOfBirth, existing.enrollmentDate);
+      const effectiveDob = childData.dateOfBirth || existing.dateOfBirth;
+      const effectiveEnrollmentDate = childData.enrollmentDate || existing.enrollmentDate;
+
+      if (Object.prototype.hasOwnProperty.call(childData, "enrollmentDate")) {
+        const today = new Date();
+        const todayDay = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+        const enrollmentDay = new Date(Date.UTC(
+          effectiveEnrollmentDate.getUTCFullYear(),
+          effectiveEnrollmentDate.getUTCMonth(),
+          effectiveEnrollmentDate.getUTCDate()
+        ));
+        if (enrollmentDay > todayDay) {
+          return res.status(400).json({ message: "enrollmentDate cannot be in the future" });
+        }
+      }
+
+      if (effectiveEnrollmentDate < effectiveDob) {
+        return res.status(400).json({ message: "enrollmentDate cannot be before dateOfBirth" });
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(childData, "dateOfBirth") ||
+        Object.prototype.hasOwnProperty.call(childData, "enrollmentDate")
+      ) {
+        const ageMonths = computeAgeInMonths(effectiveDob, effectiveEnrollmentDate);
         if (ageMonths < 6 || ageMonths > 23) {
           return res.status(400).json({
             message: "Child is not eligible for this program. Only children aged 6–23 months can be enrolled.",
