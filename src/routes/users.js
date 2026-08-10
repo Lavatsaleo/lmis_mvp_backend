@@ -18,6 +18,7 @@ const createUserSchema = z.object({
   password: z.string().min(8),
   role: z.enum(["SUPER_ADMIN", "WAREHOUSE_OFFICER", "FACILITY_OFFICER", "CLINICIAN", "VIEWER"]),
   facilityCode: z.string().min(1).optional(),
+  implementationId: z.string().min(1).optional(),
 });
 
 router.post("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
@@ -35,6 +36,9 @@ router.post("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req,
     }
 
     let facilityId = null;
+    let implementationId = parsed.data.implementationId
+      ? String(parsed.data.implementationId)
+      : req.user.implementationId || null;
 
     if (role !== "SUPER_ADMIN" && role !== "VIEWER") {
       const facility = await prisma.facility.findUnique({ where: { code: facilityCode } });
@@ -64,13 +68,28 @@ router.post("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req,
         }
       }
 
+      if (implementationId && facility.implementationId && implementationId !== facility.implementationId) {
+        return res.status(400).json({ message: "User and facility must belong to the same implementation" });
+      }
+
+      implementationId = facility.implementationId || implementationId;
       facilityId = facility.id;
+    }
+
+    if (implementationId) {
+      const implementation = await prisma.implementation.findUnique({
+        where: { id: implementationId },
+        select: { id: true, isActive: true },
+      });
+      if (!implementation || !implementation.isActive) {
+        return res.status(400).json({ message: "implementationId not found or inactive" });
+      }
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
 
     const user = await prisma.user.create({
-      data: { email, fullName, passwordHash, role, facilityId, isActive: true },
+      data: { email, fullName, passwordHash, role, facilityId, implementationId, isActive: true },
     });
 
     return res.status(201).json({
@@ -81,6 +100,7 @@ router.post("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req,
         fullName: user.fullName,
         role: user.role,
         facilityId: user.facilityId,
+        implementationId: user.implementationId,
         lastLoginAt: user.lastLoginAt,
       },
     });
@@ -131,6 +151,15 @@ router.get("/admin/users", requireAuth, requireRole("SUPER_ADMIN"), async (req, 
           role: true,
           isActive: true,
           facilityId: true,
+          implementationId: true,
+          implementation: {
+            select: {
+              id: true,
+              code: true,
+              name: true,
+              country: { select: { id: true, code: true, name: true } },
+            },
+          },
           facility: { select: { id: true, code: true, name: true, type: true } },
           createdAt: true,
           lastLoginAt: true,

@@ -52,11 +52,75 @@ enum AssessmentType {
   DISCHARGE
 }
 
+// Platform modules enabled per implementation/programme.
+// PHARMACY is introduced as a separate capability now, while its detailed
+// workflows will be refactored in a later phase.
+enum ModuleCode {
+  LOGISTICS
+  PHARMACY
+  CLINICAL
+}
+
+model Country {
+  id       String  @id @default(cuid())
+  code     String  @unique
+  name     String
+  isActive Boolean @default(true)
+
+  implementations Implementation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Implementation {
+  id        String  @id @default(cuid())
+  countryId String
+  code      String
+  name      String
+  isActive  Boolean @default(true)
+
+  country Country @relation(fields: [countryId], references: [id])
+  modules ImplementationModule[]
+
+  // Phase 1 links. These are nullable on the child models so the migration is
+  // additive and safe for the existing Kenya production data.
+  facilities Facility[]
+  users      User[]
+  products   Product[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([countryId, code])
+  @@index([countryId])
+  @@index([isActive])
+}
+
+model ImplementationModule {
+  id               String     @id @default(cuid())
+  implementationId String
+  module           ModuleCode
+  isEnabled        Boolean    @default(true)
+
+  implementation Implementation @relation(fields: [implementationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([implementationId, module])
+  @@index([implementationId])
+  @@index([module, isEnabled])
+}
+
 model Facility {
   id   String       @id @default(cuid())
   code String       @unique
   name String
   type FacilityType @default(FACILITY)
+
+  implementationId String?
+  implementation   Implementation? @relation(fields: [implementationId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -89,6 +153,7 @@ model Facility {
   assessments InDepthAssessment[]
 
   @@index([warehouseId])
+  @@index([implementationId])
 }
 
 model User {
@@ -102,6 +167,9 @@ model User {
 
   facilityId String?
   facility   Facility? @relation(fields: [facilityId], references: [id])
+
+  implementationId String?
+  implementation   Implementation? @relation(fields: [implementationId], references: [id])
 
   // Logistics events performed by this user
   boxEvents BoxEvent[] @relation("PerformedBoxEvents")
@@ -122,6 +190,7 @@ model User {
   shipmentItems ShipmentItem[]
 
   @@index([facilityId])
+  @@index([implementationId])
   @@index([role])
 }
 
@@ -153,7 +222,12 @@ model Product {
   code String @unique
   name String
 
+  implementationId String?
+  implementation   Implementation? @relation(fields: [implementationId], references: [id])
+
   boxes Box[]
+
+  @@index([implementationId])
 }
 
 model Box {

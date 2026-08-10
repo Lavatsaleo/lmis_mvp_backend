@@ -9,6 +9,7 @@ const {
   ACCESS_TOKEN_EXPIRES_IN,
   REFRESH_TOKEN_EXPIRES_IN,
 } = require("../utils");
+const { implementationInclude, buildPlatformContext } = require("../platform/context");
 
 const router = express.Router();
 
@@ -26,6 +27,7 @@ function buildUserPayload(user) {
     userId: user.id,
     role: user.role,
     facilityId: user.facilityId || null,
+    implementationId: user.implementationId || null,
   };
 }
 
@@ -36,6 +38,8 @@ function buildUserResponse(user) {
     fullName: user.fullName,
     role: user.role,
     facilityId: user.facilityId,
+    implementationId: user.implementationId || null,
+    platformContext: buildPlatformContext(user),
     facility: user.facility
       ? {
           id: user.facility.id,
@@ -59,7 +63,10 @@ router.post("/login", async (req, res) => {
 
   const user = await prisma.user.findUnique({
     where: { email },
-    include: { facility: true },
+    include: {
+      facility: true,
+      implementation: { include: implementationInclude },
+    },
   });
 
   if (!user || !user.isActive) {
@@ -107,7 +114,10 @@ router.post("/refresh", async (req, res) => {
 
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
-      include: { facility: true },
+      include: {
+        facility: true,
+        implementation: { include: implementationInclude },
+      },
     });
 
     if (!user || !user.isActive) {

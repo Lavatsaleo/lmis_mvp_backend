@@ -23,12 +23,25 @@ function normalizeType(type) {
  */
 router.post("/", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
   try {
-    const { code, name, type, warehouseId } = req.body || {};
+    const { code, name, type, warehouseId, implementationId } = req.body || {};
     if (!code || !name) {
       return res.status(400).json({ message: "code and name are required" });
     }
 
     const facilityType = normalizeType(type);
+    const effectiveImplementationId = implementationId
+      ? String(implementationId)
+      : req.user.implementationId || null;
+
+    if (effectiveImplementationId) {
+      const implementation = await prisma.implementation.findUnique({
+        where: { id: effectiveImplementationId },
+        select: { id: true, isActive: true },
+      });
+      if (!implementation || !implementation.isActive) {
+        return res.status(400).json({ message: "implementationId not found or inactive" });
+      }
+    }
 
     // If creating a FACILITY and warehouseId is provided, validate it exists + is a warehouse
     if (facilityType === "FACILITY" && warehouseId) {
@@ -37,6 +50,9 @@ router.post("/", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
       if (wh.type !== "WAREHOUSE") {
         return res.status(400).json({ message: "warehouseId must reference a WAREHOUSE facility" });
       }
+      if (effectiveImplementationId && wh.implementationId && wh.implementationId !== effectiveImplementationId) {
+        return res.status(400).json({ message: "Facility and warehouse must belong to the same implementation" });
+      }
     }
 
     const facility = await prisma.facility.create({
@@ -44,6 +60,7 @@ router.post("/", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
         code: String(code).trim(),
         name: String(name).trim(),
         type: facilityType,
+        implementationId: effectiveImplementationId,
         warehouseId: facilityType === "FACILITY" ? (warehouseId ? String(warehouseId) : null) : null,
       },
     });
@@ -89,6 +106,9 @@ router.patch(
       if (!wh) return res.status(404).json({ message: "Warehouse not found" });
       if (wh.type !== "WAREHOUSE") {
         return res.status(400).json({ message: "Target must be a WAREHOUSE facility" });
+      }
+      if (facility.implementationId && wh.implementationId && facility.implementationId !== wh.implementationId) {
+        return res.status(400).json({ message: "Facility and warehouse must belong to the same implementation" });
       }
 
       const updated = await prisma.facility.update({
@@ -171,6 +191,16 @@ router.patch(
         return res.status(400).json({
           message: "Some records are not FACILITY and cannot be linked",
           nonFacility,
+        });
+      }
+
+      const crossImplementation = facilities
+        .filter((f) => f.implementationId && wh.implementationId && f.implementationId !== wh.implementationId)
+        .map((f) => ({ id: f.id, code: f.code, implementationId: f.implementationId }));
+      if (crossImplementation.length > 0) {
+        return res.status(400).json({
+          message: "Some facilities belong to a different implementation than the warehouse",
+          crossImplementation,
         });
       }
 

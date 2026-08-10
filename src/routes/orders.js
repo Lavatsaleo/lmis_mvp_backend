@@ -109,11 +109,36 @@ router.post(
         }
       }
 
-      const product = await prisma.product.upsert({
-        where: { code: productCode },
-        update: { name: productName },
-        create: { code: productCode, name: productName },
-      });
+      const effectiveImplementationId = warehouse.implementationId || req.user.implementationId || null;
+
+      let product = await prisma.product.findUnique({ where: { code: productCode } });
+      if (product) {
+        if (
+          effectiveImplementationId &&
+          product.implementationId &&
+          product.implementationId !== effectiveImplementationId
+        ) {
+          return res.status(409).json({
+            message: `Product code "${productCode}" already belongs to a different implementation.`,
+          });
+        }
+
+        product = await prisma.product.update({
+          where: { id: product.id },
+          data: {
+            name: productName,
+            implementationId: product.implementationId || effectiveImplementationId,
+          },
+        });
+      } else {
+        product = await prisma.product.create({
+          data: {
+            code: productCode,
+            name: productName,
+            implementationId: effectiveImplementationId,
+          },
+        });
+      }
 
       const createdBoxUids = [];
 

@@ -1,5 +1,6 @@
 const { verifyAccessToken } = require("../utils");
 const { prisma } = require("../db");
+const { implementationInclude, buildPlatformContext } = require("../platform/context");
 
 async function requireAuth(req, res, next) {
   try {
@@ -19,6 +20,9 @@ async function requireAuth(req, res, next) {
           include: {
             warehouse: true,
           },
+        },
+        implementation: {
+          include: implementationInclude,
         },
       },
     });
@@ -51,6 +55,8 @@ async function requireAuth(req, res, next) {
       fullName: user.fullName,
       role: user.role,
       facilityId: user.facilityId,
+      implementationId: user.implementationId || null,
+      platformContext: buildPlatformContext(user),
       facility: user.facility
         ? { id: user.facility.id, code: user.facility.code, name: user.facility.name }
         : null,
