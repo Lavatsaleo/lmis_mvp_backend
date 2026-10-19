@@ -34,6 +34,9 @@ function buildPlatformContext(user) {
       id: implementation.id,
       code: implementation.code,
       name: implementation.name,
+      reportingCurrencyCode: implementation.reportingCurrencyCode || "USD",
+      // Mobile stock-control tools (receive PO, stock count, report loss).
+      warehouseTools: !!implementation.warehouseTools,
     },
     enabledModules: Array.isArray(implementation.modules)
       ? implementation.modules.map((row) => row.module)

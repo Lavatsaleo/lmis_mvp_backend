@@ -19,28 +19,37 @@ function signToken(payload) {
   });
 }
 
+// Tokens carry `typ` so neither kind can stand in for the other, even when
+// JWT_REFRESH_SECRET is not set and both are signed with the same secret.
+// Tokens issued before this change have no `typ` and are still accepted.
 function signAccessToken(payload) {
-  return jwt.sign(payload, getAccessSecret(), {
+  return jwt.sign({ ...payload, typ: "access" }, getAccessSecret(), {
     expiresIn: ACCESS_TOKEN_EXPIRES_IN,
   });
 }
 
-function signRefreshToken(payload) {
-  return jwt.sign(payload, getRefreshSecret(), {
+// `jti` identifies the stored RefreshToken row (see routes/auth.js).
+function signRefreshToken(payload, jti) {
+  return jwt.sign({ ...payload, typ: "refresh" }, getRefreshSecret(), {
     expiresIn: REFRESH_TOKEN_EXPIRES_IN,
+    ...(jti ? { jwtid: jti } : {}),
   });
 }
 
 function verifyToken(token) {
-  return jwt.verify(token, getAccessSecret());
+  return verifyAccessToken(token);
 }
 
 function verifyAccessToken(token) {
-  return jwt.verify(token, getAccessSecret());
+  const decoded = jwt.verify(token, getAccessSecret());
+  if (decoded?.typ === "refresh") throw new Error("Refresh token cannot be used as an access token");
+  return decoded;
 }
 
 function verifyRefreshToken(token) {
-  return jwt.verify(token, getRefreshSecret());
+  const decoded = jwt.verify(token, getRefreshSecret());
+  if (decoded?.typ === "access") throw new Error("Access token cannot be used to refresh");
+  return decoded;
 }
 
 module.exports = {

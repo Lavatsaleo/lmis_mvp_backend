@@ -5,6 +5,47 @@ const prisma = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
 
 const { requireAuth } = require('../middleware/auth');
+const { countryWideImplementationId, locationWithDescendants } = require('../auth/access');
+
+// Read-only wider views (officers keep their own warehouse/facility rules):
+//  - COUNTRY_ADMIN / country-wide VIEWER: every shipment sent from a
+//    warehouse in their implementation.
+//  - VIEWER on a warehouse: shipments out of or into anything below it.
+// Returns { implementationId } | { locationIds } | null (use the normal rules).
+async function widerShipmentView(req) {
+  const implementationId = countryWideImplementationId(req.user);
+  if (implementationId) return { implementationId };
+  if (req.user.role === 'VIEWER' && req.user.facilityType === 'WAREHOUSE' && req.user.facilityId) {
+    return { locationIds: await locationWithDescendants(req.user.facilityId) };
+  }
+  return null;
+}
+
+async function canSeeShipment(req, shipment) {
+  if (req.user.role === 'SUPER_ADMIN') return true;
+  const wider = await widerShipmentView(req);
+  if (wider?.implementationId) {
+    const from = await prisma.facility.findUnique({
+      where: { id: String(shipment.fromWarehouseId) },
+      select: { implementationId: true },
+    });
+    return from?.implementationId === wider.implementationId;
+  }
+  if (wider?.locationIds) {
+    return wider.locationIds.includes(String(shipment.fromWarehouseId)) || wider.locationIds.includes(String(shipment.toFacilityId));
+  }
+  if (req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') {
+    const myWarehouseId = req.user.warehouseId
+      ? String(req.user.warehouseId)
+      : req.user.facilityId
+      ? String(req.user.facilityId)
+      : null;
+    // Sent from this warehouse, or (transfer) addressed to it.
+    return !!myWarehouseId && (String(shipment.fromWarehouseId) === myWarehouseId || String(shipment.toFacilityId) === myWarehouseId);
+  }
+  const myFacilityId = req.user.facilityId ? String(req.user.facilityId) : null;
+  return !!myFacilityId && String(shipment.toFacilityId) === myFacilityId;
+}
 
 function mmToPt(mm) {
   return (mm * 72) / 25.4;
@@ -34,7 +75,8 @@ function safeDateTime(d) {
 // Query (optional): includeReceived=true  (only relevant when status is not provided)
 // Scoping:
 //  - SUPER_ADMIN: can filter by fromWarehouseId/toFacilityId
-//  - WAREHOUSE_OFFICER (or users assigned to a warehouse): only own warehouse shipments
+//  - WAREHOUSE_OFFICER (or users assigned to a warehouse): own warehouse's outgoing
+//    shipments, or with direction=incoming the transfers coming into it
 //  - FACILITY users: only shipments to their facility
 // ---------------------------------------------------------------------------
 router.get('/', requireAuth, async (req, res) => {
@@ -54,15 +96,26 @@ router.get('/', requireAuth, async (req, res) => {
       where.status = status;
     } else if (
       req.user.role !== 'SUPER_ADMIN' &&
+      !countryWideImplementationId(req.user) &&
       !(req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') &&
       !includeReceived
     ) {
       where.status = { in: ['DISPATCHED'] };
     }
 
+    const wider = req.user.role === 'SUPER_ADMIN' ? null : await widerShipmentView(req);
+    const incoming = String(req.query.direction || '').toLowerCase() === 'incoming';
+
     if (req.user.role === 'SUPER_ADMIN') {
       if (req.query.fromWarehouseId) where.fromWarehouseId = String(req.query.fromWarehouseId);
       if (req.query.toFacilityId) where.toFacilityId = String(req.query.toFacilityId);
+    } else if (wider?.implementationId) {
+      where.fromWarehouse = { implementationId: wider.implementationId };
+      if (req.query.fromWarehouseId) where.fromWarehouseId = String(req.query.fromWarehouseId);
+      if (req.query.toFacilityId) where.toFacilityId = String(req.query.toFacilityId);
+    } else if (wider?.locationIds) {
+      if (incoming) where.toFacilityId = { in: wider.locationIds };
+      else where.OR = [{ fromWarehouseId: { in: wider.locationIds } }, { toFacilityId: { in: wider.locationIds } }];
     } else if (req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') {
       const myWarehouseId = req.user.warehouseId
         ? String(req.user.warehouseId)
@@ -71,17 +124,35 @@ router.get('/', requireAuth, async (req, res) => {
         : null;
 
       if (!myWarehouseId) return res.json([]);
-      where.fromWarehouseId = myWarehouseId;
+      // direction=incoming: transfers coming INTO this warehouse (a field base
+      // receiving from the main warehouse). Default stays outgoing, as before.
+      if (String(req.query.direction || '').toLowerCase() === 'incoming') {
+        where.toFacilityId = myWarehouseId;
+      } else {
+        where.fromWarehouseId = myWarehouseId;
+      }
     } else {
       const myFacilityId = req.user.facilityId ? String(req.user.facilityId) : null;
       if (!myFacilityId) return res.json([]);
       where.toFacilityId = myFacilityId;
     }
 
+    // Paging: default 100 (what older clients expect), up to 500 per page. The
+    // body stays an array for backward compatibility; the total is in a header.
+    const takeRaw = Number.parseInt(String(req.query.take ?? '100'), 10);
+    const take = Number.isFinite(takeRaw) ? Math.min(500, Math.max(1, takeRaw)) : 100;
+    const skipRaw = Number.parseInt(String(req.query.skip ?? '0'), 10);
+    const skip = Number.isFinite(skipRaw) ? Math.max(0, skipRaw) : 0;
+
+    const total = await prisma.shipment.count({ where });
+    res.setHeader('X-Total-Count', String(total));
+    res.setHeader('Access-Control-Expose-Headers', 'X-Total-Count');
+
     const shipments = await prisma.shipment.findMany({
       where,
-      orderBy: { dispatchedAt: 'desc' },
-      take: 100,
+      orderBy: [{ dispatchedAt: 'desc' }, { id: 'asc' }],
+      take,
+      skip,
       include: {
         fromWarehouse: { select: { id: true, code: true, name: true } },
         toFacility: { select: { id: true, code: true, name: true } },
@@ -154,24 +225,9 @@ router.get('/:shipmentId', requireAuth, async (req, res) => {
 
     if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
 
-    // Scoping
-    if (req.user.role !== 'SUPER_ADMIN') {
-      if (req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') {
-        const myWarehouseId = req.user.warehouseId
-          ? String(req.user.warehouseId)
-          : req.user.facilityId
-          ? String(req.user.facilityId)
-          : null;
-
-        if (!myWarehouseId || String(shipment.fromWarehouseId) !== myWarehouseId) {
-          return res.status(403).json({ message: 'Forbidden' });
-        }
-      } else {
-        const myFacilityId = req.user.facilityId ? String(req.user.facilityId) : null;
-        if (!myFacilityId || String(shipment.toFacilityId) !== myFacilityId) {
-          return res.status(403).json({ message: 'Forbidden' });
-        }
-      }
+    // Scoping (same rules for detail and waybill)
+    if (!(await canSeeShipment(req, shipment))) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
 
     return res.json(shipment);
@@ -193,7 +249,7 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
       where: { id: String(shipmentId) },
       include: {
         fromWarehouse: { select: { code: true, name: true } },
-        toFacility: { select: { code: true, name: true } },
+        toFacility: { select: { code: true, name: true, type: true } },
         dispatchedBy: { select: { fullName: true } },
         receivedBy: { select: { fullName: true } },
         items: {
@@ -215,24 +271,9 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
 
     if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
 
-    // Scoping: same rules as detail
-    if (req.user.role !== 'SUPER_ADMIN') {
-      if (req.user.role === 'WAREHOUSE_OFFICER' || req.user.facilityType === 'WAREHOUSE') {
-        const myWarehouseId = req.user.warehouseId
-          ? String(req.user.warehouseId)
-          : req.user.facilityId
-          ? String(req.user.facilityId)
-          : null;
-
-        if (!myWarehouseId || String(shipment.fromWarehouseId) !== myWarehouseId) {
-          return res.status(403).json({ message: 'Forbidden' });
-        }
-      } else {
-        const myFacilityId = req.user.facilityId ? String(req.user.facilityId) : null;
-        if (!myFacilityId || String(shipment.toFacilityId) !== myFacilityId) {
-          return res.status(403).json({ message: 'Forbidden' });
-        }
-      }
+    // Scoping (same rules for detail and waybill)
+    if (!(await canSeeShipment(req, shipment))) {
+      return res.status(403).json({ message: 'Forbidden' });
     }
 
     // PDF setup
@@ -250,7 +291,9 @@ router.get('/:shipmentId/waybill.pdf', requireAuth, async (req, res) => {
     doc.text(`Manifest No: ${shipment.manifestNo}`);
     doc.text(`Date: ${safeDate(shipment.dispatchedAt)}`);
     doc.text(`From (Warehouse): ${shipment.fromWarehouse.name} (${shipment.fromWarehouse.code})`);
-    doc.text(`To (Facility): ${shipment.toFacility.name} (${shipment.toFacility.code})`);
+    // Warehouse-to-warehouse transfers (e.g. to a field base) say so on the waybill.
+    const toLabel = shipment.toFacility.type === 'WAREHOUSE' ? 'To (Warehouse)' : 'To (Facility)';
+    doc.text(`${toLabel}: ${shipment.toFacility.name} (${shipment.toFacility.code})`);
     doc.text(`Dispatched by: ${shipment.dispatchedBy.fullName}`);
 
     const first = shipment.items[0]?.box;

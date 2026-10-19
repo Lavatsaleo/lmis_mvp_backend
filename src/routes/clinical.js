@@ -4,6 +4,15 @@ const router = express.Router();
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requireRole } = require("../middleware/rbac");
+const { requireModule } = require("../middleware/modules");
+
+// Every clinical endpoint belongs to the CLINICAL module (off for South Sudan,
+// where clinical tracking is done in DHIS2).
+router.use(requireAuth, requireModule("CLINICAL"));
+
+// How far before "now" the sync-delta's final page restarts the next pull, to
+// catch writes that committed just after the delta query ran.
+const DELTA_SAFETY_WINDOW_MS = 60 * 1000;
 
 // ---------------- helpers ----------------
 function computeAgeInMonths(dob, refDate = new Date()) {
@@ -477,7 +486,215 @@ function deriveLatestAppointmentVisit(visits) {
   return withAppointment[0];
 }
 
+// ---------------- request idempotency helpers ----------------
+
+// The mobile sync queue sends a stable id with every queued request. We store it
+// on the record it creates so a retry of the same request is answered with the
+// original record instead of creating a duplicate.
+function clientRequestIdFrom(req) {
+  const raw = req.header("X-Idempotency-Key") || req.header("X-Queue-Id") || req.body?.clientRequestId;
+  const value = raw == null ? "" : String(raw).trim();
+  return value && value.length <= 191 ? value : null;
+}
+
+function isUniqueViolationOn(err, field) {
+  return err?.code === "P2002" && String(err?.meta?.target ?? "").includes(field);
+}
+
+function isSameEnrollmentIdentity(existing, { firstName, lastName, dateOfBirth }) {
+  return (
+    normalizeDuplicateText(existing.firstName) === normalizeDuplicateText(firstName) &&
+    normalizeDuplicateText(existing.lastName) === normalizeDuplicateText(lastName) &&
+    sameDateOnly(existing.dateOfBirth, dateOfBirth)
+  );
+}
+
+// 409 for an enrollment whose CWC/registration number is already taken.
+// The mobile app treats a 409 carrying `child` as "already synced" and maps its
+// local child onto that record, so `child` is only returned for a legacy replay
+// (record created before request ids were stored, same name and date of birth).
+// Anything else is a genuine conflict and must go to review, not be merged.
+function sendEnrollmentConflict(res, existingChild, identity) {
+  if (!existingChild.clientRequestId && isSameEnrollmentIdentity(existingChild, identity)) {
+    return res.status(409).json({
+      message: "Child already exists (uniqueChildNumber duplicate)",
+      child: existingChild,
+    });
+  }
+
+  return res.status(409).json({
+    code: "CHILD_CONFLICT",
+    message:
+      "Another child in this facility already uses this CWC number / registration number. Review the record before syncing it again.",
+    existingChild: {
+      id: existingChild.id,
+      uniqueChildNumber: existingChild.uniqueChildNumber,
+      cwcNumber: existingChild.cwcNumber,
+      firstName: existingChild.firstName,
+      lastName: existingChild.lastName,
+      dateOfBirth: existingChild.dateOfBirth,
+    },
+  });
+}
+
+// Rebuild the /enroll success payload for a replayed request.
+async function buildEnrollmentReplayPayload(childId, { includeVisit }) {
+  const full = await prisma.child.findUnique({
+    where: { id: childId },
+    include: {
+      caregiver: true,
+      facility: true,
+      inDepthAssessments: { where: { assessmentType: "ENROLLMENT" }, take: 1 },
+      visits: {
+        orderBy: [{ visitDate: "asc" }, { createdAt: "asc" }],
+        take: 1,
+        include: { dispenses: true },
+      },
+    },
+  });
+  if (!full) return null;
+
+  const { caregiver, facility, inDepthAssessments, visits, ...childRow } = full;
+  const visit = includeVisit ? visits[0] || null : null;
+  const caseCount = await prisma.duplicateCase.count({ where: { primaryChildId: full.id } });
+
+  return {
+    message: "Enrollment already recorded (replay)",
+    replayed: true,
+    facility: facility ? { id: facility.id, code: facility.code, name: facility.name } : null,
+    caregiver: addLegacyCaregiverFields(caregiver),
+    child: addLegacyChildFields(childRow),
+    assessment: addLegacyAssessmentFields(inDepthAssessments[0] || null),
+    visit: visit ? addLegacyVisitFields(visit) : null,
+    dispense: visit ? visit.dispenses.map((d) => addLegacyDispenseFields(d, visit, childRow)) : [],
+    duplicateReview: { caseCount, cases: [] },
+  };
+}
+
+// Rebuild the POST /visits success payload for a replayed request.
+async function buildVisitReplayPayload(visitId, child) {
+  const visit = await prisma.childVisit.findUnique({
+    where: { id: visitId },
+    include: { dispenses: true },
+  });
+  if (!visit) return null;
+
+  return {
+    message: "Visit already recorded (replay)",
+    replayed: true,
+    visit: {
+      ...addLegacyVisitFields(visit),
+      dispenses: visit.dispenses.map((d) => addLegacyDispenseFields(d, visit, child)),
+    },
+  };
+}
+
+// Some enrollment "visits" the phone holds are not ChildVisit rows:
+//  - buildChildSummaryPayload adds a synthetic `assessment-<id>` visit for an
+//    enrollment assessment that has no visit that day;
+//  - older enroll responses without a visit made the phone store the raw
+//    enrollment assessment id.
+// Editing either sends PATCH /visits/<that id>. Resolve it to the real visit on
+// the assessment day if one exists (or one this same edit already created), or
+// return the assessment so the caller can create the visit.
+const VISIT_INCLUDE_FOR_EDIT = { dispenses: { include: { box: true } } };
+
+async function resolveEnrollmentVisitTarget(req, child, visitId) {
+  const raw = String(visitId);
+  const assessmentId = raw.startsWith("assessment-") ? raw.slice("assessment-".length) : raw;
+  const assessment = await prisma.inDepthAssessment.findFirst({
+    where: { id: assessmentId, childId: child.id, assessmentType: "ENROLLMENT" },
+  });
+  if (!assessment) return null;
+
+  const clientRequestId = clientRequestIdFrom(req);
+  if (clientRequestId) {
+    const created = await prisma.childVisit.findUnique({ where: { clientRequestId }, include: VISIT_INCLUDE_FOR_EDIT });
+    if (created && created.childId === child.id) return { visit: created };
+  }
+
+  const sameDay = await findExistingVisitForSameChildAndDay(prisma, {
+    childId: child.id,
+    facilityId: child.facilityId,
+    visitDate: assessment.assessmentDate,
+  });
+  if (sameDay) {
+    return { visit: await prisma.childVisit.findUnique({ where: { id: sameDay.id }, include: VISIT_INCLUDE_FOR_EDIT }) };
+  }
+
+  return { assessment };
+}
+
 // ---------------- stock helpers ----------------
+
+// Locking read of a facility's dispensable boxes. FOR UPDATE returns the latest
+// committed balances (not the transaction's snapshot) and holds the row locks
+// until commit, so concurrent dispenses at one facility queue up instead of
+// allocating from the same stale balance.
+async function lockFacilityStockForDispense(tx, facilityId) {
+  return tx.$queryRaw`
+    SELECT id, boxUid, expiryDate, sachetsPerBox, sachetsRemaining, createdAt
+    FROM Box
+    WHERE currentFacilityId = ${facilityId} AND status = 'IN_FACILITY'
+    ORDER BY expiryDate ASC, createdAt ASC
+    FOR UPDATE`;
+}
+
+// Take sachets from one box. The WHERE clause re-checks location, status and
+// balance at write time and the decrement is relative, so a concurrent dispense
+// can neither be overwritten nor push the balance below zero.
+// Returns the remaining balance after the take.
+async function takeSachetsFromBox(tx, { boxId, facilityId, quantity }) {
+  const result = await tx.box.updateMany({
+    where: {
+      id: boxId,
+      currentFacilityId: facilityId,
+      status: "IN_FACILITY",
+      sachetsRemaining: { gte: quantity },
+    },
+    data: { sachetsRemaining: { decrement: quantity } },
+  });
+
+  if (result.count !== 1) {
+    const current = await tx.box.findUnique({
+      where: { id: boxId },
+      select: { boxUid: true, status: true, currentFacilityId: true, sachetsRemaining: true },
+    });
+    const available = current && current.status === "IN_FACILITY" && current.currentFacilityId === facilityId;
+    const e = new Error(
+      available
+        ? "Not enough sachets remaining in this box"
+        : "Box is not available IN_FACILITY in this facility for dispensing"
+    );
+    e.statusCode = 400;
+    e.meta = {
+      boxUid: current?.boxUid,
+      currentStatus: current?.status,
+      sachetsRemaining: current?.sachetsRemaining,
+      requested: quantity,
+    };
+    throw e;
+  }
+
+  const after = await tx.box.findUnique({ where: { id: boxId }, select: { sachetsRemaining: true } });
+  const remaining = after?.sachetsRemaining ?? 0;
+  if (remaining === 0) {
+    await tx.box.update({ where: { id: boxId }, data: { status: "DISPENSED" } });
+  }
+  return remaining;
+}
+
+// Return sachets to a box (visit edit reversal) in one atomic statement, capped
+// at the pack size. Returns the new balance.
+async function returnSachetsToBox(tx, { boxId, quantity }) {
+  await tx.$executeRaw`
+    UPDATE Box
+    SET sachetsRemaining = LEAST(sachetsPerBox, sachetsRemaining + ${quantity}),
+        status = 'IN_FACILITY'
+    WHERE id = ${boxId}`;
+  const after = await tx.box.findUnique({ where: { id: boxId }, select: { sachetsRemaining: true } });
+  return after?.sachetsRemaining ?? null;
+}
 
 /**
  * Auto-allocate sachets from facility stock WITHOUT requiring the client to scan a box.
@@ -505,21 +722,8 @@ async function autoAllocateDispenseFromFacility(tx, {
     throw e;
   }
 
-  const boxes = await tx.box.findMany({
-    where: { currentFacilityId: facilityId, status: "IN_FACILITY" },
-    select: {
-      id: true,
-      boxUid: true,
-      expiryDate: true,
-      sachetsPerBox: true,
-      sachetsRemaining: true,
-      createdAt: true,
-    },
-    orderBy: [
-      { expiryDate: "asc" }, // FEFO
-      { createdAt: "asc" },
-    ],
-  });
+  // FEFO order; rows stay locked until this transaction commits.
+  const boxes = await lockFacilityStockForDispense(tx, facilityId);
 
   if (!boxes || boxes.length === 0) {
     const e = new Error("No boxes available IN_FACILITY in this facility for dispensing");
@@ -552,7 +756,6 @@ async function autoAllocateDispenseFromFacility(tx, {
     if (rem <= 0) continue;
 
     const take = Math.min(rem, remainingToAllocate);
-    const newRemaining = rem - take;
 
     const d = await tx.dispense.create({
       data: {
@@ -563,15 +766,9 @@ async function autoAllocateDispenseFromFacility(tx, {
       },
     });
 
-    createdDispenses.push({ dispense: d, boxUid: b.boxUid, taken: take, remainingAfter: newRemaining });
+    const newRemaining = await takeSachetsFromBox(tx, { boxId: b.id, facilityId, quantity: take });
 
-    await tx.box.update({
-      where: { id: b.id },
-      data: {
-        sachetsRemaining: newRemaining,
-        status: newRemaining === 0 ? "DISPENSED" : "IN_FACILITY",
-      },
-    });
+    createdDispenses.push({ dispense: d, boxUid: b.boxUid, taken: take, remainingAfter: newRemaining });
 
     await tx.boxEvent.create({
       data: {
@@ -603,19 +800,9 @@ async function reverseVisitDispensesToStock(tx, {
     if (!Number.isFinite(qty) || qty <= 0) continue;
 
     if (d.boxId) {
-      const box = await tx.box.findUnique({ where: { id: d.boxId } });
+      const box = await tx.box.findUnique({ where: { id: d.boxId }, select: { id: true } });
       if (box) {
-        const perBox = Number.isFinite(box.sachetsPerBox) ? box.sachetsPerBox : 600;
-        const currentRemaining = Number.isFinite(box.sachetsRemaining) ? box.sachetsRemaining : 0;
-        const newRemaining = Math.min(perBox, currentRemaining + qty);
-
-        await tx.box.update({
-          where: { id: box.id },
-          data: {
-            sachetsRemaining: newRemaining,
-            status: "IN_FACILITY",
-          },
-        });
+        const newRemaining = await returnSachetsToBox(tx, { boxId: box.id, quantity: qty });
 
         await tx.boxEvent.create({
           data: {
@@ -905,26 +1092,46 @@ async function assertChildInMyFacility(req, childId) {
   return child;
 }
 
+const CHILD_SUMMARY_INCLUDE = {
+  caregiver: true,
+  facility: true,
+  inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
+  visits: {
+    orderBy: { visitDate: "desc" },
+    include: {
+      dispenses: {
+        orderBy: { createdAt: "desc" },
+        include: { box: true },
+      },
+    },
+  },
+};
+
 async function buildChildSummaryPayload(childId) {
   const child = await prisma.child.findUnique({
     where: { id: childId },
-    include: {
-      caregiver: true,
-      facility: true,
-      inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
-      visits: {
-        orderBy: { visitDate: "desc" },
-        include: {
-          dispenses: {
-            orderBy: { createdAt: "desc" },
-            include: { box: true },
-          },
-        },
-      },
-    },
+    include: CHILD_SUMMARY_INCLUDE,
   });
+  return child ? summarizeLoadedChild(child) : null;
+}
 
-  if (!child) return null;
+// Batched version for lists (sync-delta): a few queries per chunk instead of
+// one full child query per child. Keeps the order of `childIds`.
+async function buildChildSummaryPayloads(childIds, chunkSize = 100) {
+  const out = [];
+  for (let i = 0; i < childIds.length; i += chunkSize) {
+    const ids = childIds.slice(i, i + chunkSize);
+    const rows = await prisma.child.findMany({ where: { id: { in: ids } }, include: CHILD_SUMMARY_INCLUDE });
+    const byId = new Map(rows.map((c) => [c.id, c]));
+    for (const id of ids) {
+      const child = byId.get(id);
+      if (child) out.push(summarizeLoadedChild(child));
+    }
+  }
+  return out;
+}
+
+function summarizeLoadedChild(child) {
 
   const enrollmentAssessment =
     (child.inDepthAssessments || []).find((a) => a.assessmentType === "ENROLLMENT") || null;
@@ -1014,6 +1221,23 @@ router.post(
           .json({ message: "Clinical enrollment must be done in a FACILITY (not a warehouse)." });
       }
 
+      // Replay of an enrollment we already processed: return the original records.
+      const clientRequestId = clientRequestIdFrom(req);
+      if (clientRequestId) {
+        const replayed = await prisma.child.findUnique({
+          where: { clientRequestId },
+          select: { id: true, facilityId: true },
+        });
+        if (replayed) {
+          if (replayed.facilityId !== facility.id) {
+            return res.status(409).json({ message: "This request id was already used in a different facility" });
+          }
+          return res
+            .status(200)
+            .json(await buildEnrollmentReplayPayload(replayed.id, { includeVisit: isPlainObject(body.visit) }));
+        }
+      }
+
       const dob = parseDateOrNull(dateOfBirthRaw);
       if (!dob) {
         return res.status(400).json({ message: "dateOfBirth must be a valid date (YYYY-MM-DD)" });
@@ -1063,17 +1287,18 @@ router.post(
         program,
       });
 
-      const existingChild = await prisma.child.findFirst({
-        where: {
-          OR: [{ uniqueChildNumber }, { facilityId: facility.id, cwcNumber }],
-        },
-        include: { caregiver: true },
-      });
-      if (existingChild) {
-        return res.status(409).json({
-          message: "Child already exists (uniqueChildNumber duplicate)",
-          child: existingChild,
+      const identity = { firstName: childFirstName, lastName: childLastName, dateOfBirth: dob };
+      const findConflictingChild = () =>
+        prisma.child.findFirst({
+          where: {
+            OR: [{ uniqueChildNumber }, { facilityId: facility.id, cwcNumber }],
+          },
+          include: { caregiver: true },
         });
+
+      const existingChild = await findConflictingChild();
+      if (existingChild) {
+        return sendEnrollmentConflict(res, existingChild, identity);
       }
 
       let baselineAssessmentInput = null;
@@ -1160,7 +1385,9 @@ router.post(
         };
       }
 
-      const created = await prisma.$transaction(async (tx) => {
+      let created;
+      try {
+      created = await prisma.$transaction(async (tx) => {
         let caregiver = await tx.caregiver.findFirst({
           where: {
             facilityId: facility.id,
@@ -1209,6 +1436,7 @@ router.post(
             enrollmentDate,
             chpName: body.chpName ? String(body.chpName).trim() : null,
             chpContacts: body.chpContacts ? String(body.chpContacts).trim() : null,
+            clientRequestId,
           },
         });
 
@@ -1248,19 +1476,32 @@ router.post(
               heightCm: enrollmentVisitInput.heightCm ?? baselineVisitMetrics.heightCm ?? null,
               muacMm: enrollmentVisitInput.muacMm ?? baselineVisitMetrics.muacMm ?? null,
               whzScore: enrollmentVisitInput.whzScore ?? baselineVisitMetrics.whzScore ?? null,
+              sachetsPrescribed: enrollmentVisitInput.sachetsDispensed,
             },
           });
 
-          const auto = await autoAllocateDispenseFromFacility(tx, {
-            facilityId: facility.id,
-            performedByUserId: req.user.id,
-            childUniqueNumber: uniqueChildNumber,
-            visitId: enrollmentVisit.id,
-            quantitySachets: enrollmentVisitInput.sachetsDispensed,
-            note: "Enrollment dispense",
-          });
+          // A stock-out must not block enrollment. If the facility cannot cover
+          // the full prescription, enroll anyway, dispense nothing, and flag the
+          // visit for the "children not dispensed" report.
+          const stock = await lockFacilityStockForDispense(tx, facility.id);
+          const available = stock.reduce((sum, b) => sum + Math.max(0, Number(b.sachetsRemaining) || 0), 0);
 
-          enrollmentDispenses = auto.map((a) => a.dispense);
+          if (available >= enrollmentVisitInput.sachetsDispensed) {
+            const auto = await autoAllocateDispenseFromFacility(tx, {
+              facilityId: facility.id,
+              performedByUserId: req.user.id,
+              childUniqueNumber: uniqueChildNumber,
+              visitId: enrollmentVisit.id,
+              quantitySachets: enrollmentVisitInput.sachetsDispensed,
+              note: "Enrollment dispense",
+            });
+            enrollmentDispenses = auto.map((a) => a.dispense);
+          } else {
+            enrollmentVisit = await tx.childVisit.update({
+              where: { id: enrollmentVisit.id },
+              data: { notDispensedReason: "STOCK_OUT" },
+            });
+          }
         }
 
         const duplicateCases = await createDuplicateCasesForEnrollment(tx, {
@@ -1272,9 +1513,32 @@ router.post(
 
         return { caregiver, child, assessment, enrollmentVisit, enrollmentDispenses, duplicateCases };
       });
+      } catch (err) {
+        // A concurrent request won the race: either the same request (replay) or
+        // a different child that took this CWC number in the meantime.
+        if (clientRequestId && isUniqueViolationOn(err, "clientRequestId")) {
+          const replayed = await prisma.child.findUnique({ where: { clientRequestId }, select: { id: true } });
+          if (replayed) {
+            return res
+              .status(200)
+              .json(await buildEnrollmentReplayPayload(replayed.id, { includeVisit: isPlainObject(body.visit) }));
+          }
+        }
+        if (isUniqueViolationOn(err, "uniqueChildNumber") || isUniqueViolationOn(err, "cwcNumber")) {
+          const conflicting = await findConflictingChild();
+          if (conflicting) return sendEnrollmentConflict(res, conflicting, identity);
+        }
+        throw err;
+      }
 
+      const notDispensedReason = created.enrollmentVisit?.notDispensedReason || null;
       return res.status(201).json({
-        message: "Enrollment successful",
+        message: notDispensedReason
+          ? "Enrollment successful. Nothing was dispensed: the facility does not have enough stock."
+          : "Enrollment successful",
+        notDispensed: notDispensedReason
+          ? { reason: notDispensedReason, sachetsPrescribed: created.enrollmentVisit.sachetsPrescribed }
+          : null,
         facility: { id: facility.id, code: facility.code, name: facility.name },
         caregiver: addLegacyCaregiverFields(created.caregiver),
         child: addLegacyChildFields(created.child),
@@ -1587,20 +1851,39 @@ router.patch(
         childData.uniqueChildNumber = nextUniqueChildNumber;
       }
 
+      // Siblings share one caregiver record (keyed by phone within the facility).
+      // Name/village corrections apply to that person for all their children.
+      // A different phone number on one child means a different caregiver for
+      // that child: give it its own record instead of moving every sibling.
+      const contactsChanged = nextCaregiverContacts !== existing.caregiver.contacts;
+      const siblingCount = contactsChanged
+        ? await prisma.child.count({ where: { caregiverId: existing.caregiverId, id: { not: existing.id } } })
+        : 0;
+
       await prisma.$transaction(async (tx) => {
-        if (Object.keys(caregiverData).length) {
+        if (contactsChanged && siblingCount > 0) {
+          const ownCaregiver = await tx.caregiver.create({
+            data: {
+              facilityId: existing.facilityId,
+              fullName: caregiverData.fullName ?? existing.caregiver.fullName,
+              contacts: nextCaregiverContacts,
+              village: caregiverData.village !== undefined ? caregiverData.village : existing.caregiver.village,
+            },
+          });
+          childData.caregiverId = ownCaregiver.id;
+        } else if (Object.keys(caregiverData).length) {
           await tx.caregiver.update({
             where: { id: existing.caregiverId },
             data: caregiverData,
           });
         }
 
-        if (Object.keys(childData).length) {
-          await tx.child.update({
-            where: { id: existing.id },
-            data: childData,
-          });
-        }
+        // Always touch the child (even for caregiver-only edits) so the facility
+        // sync-delta delivers the change to other phones.
+        await tx.child.update({
+          where: { id: existing.id },
+          data: { ...childData, updatedAt: new Date() },
+        });
       });
 
       const summary = await buildChildSummaryPayload(existing.id);
@@ -1657,6 +1940,11 @@ router.post(
         return res.status(400).json({ message: "visitDate cannot be before the child's enrollmentDate" });
       }
 
+      // Same rule as editing a visit: a visit (and its dispense) cannot be in the future.
+      if (startOfDay(visitDate) > startOfDay(new Date())) {
+        return res.status(400).json({ message: "visitDate cannot be in the future" });
+      }
+
       const weightKg = toNumberOrNull(body.weightKg ?? body.weight);
       const heightCm = toNumberOrNull(body.heightCm ?? body.height);
 
@@ -1678,6 +1966,22 @@ router.post(
         nextAppointmentDate = parsedNext;
       }
 
+      // Replay of a request we already processed (lost response / duplicate send):
+      // answer with the original visit rather than creating another one.
+      const clientRequestId = clientRequestIdFrom(req);
+      if (clientRequestId) {
+        const replayed = await prisma.childVisit.findUnique({
+          where: { clientRequestId },
+          select: { id: true, childId: true },
+        });
+        if (replayed) {
+          if (replayed.childId !== childCheck.id) {
+            return res.status(409).json({ message: "This request id was already used for a different child" });
+          }
+          return res.status(200).json(await buildVisitReplayPayload(replayed.id, childCheck));
+        }
+      }
+
       const existingSameDayVisit = await findExistingVisitForSameChildAndDay(prisma, {
         childId: childCheck.id,
         facilityId: childCheck.facilityId,
@@ -1695,7 +1999,11 @@ router.post(
           addLegacyDispenseFields(d, existingVisitWithDispenses, childCheck)
         );
 
+        // A replay of this same request was answered above, so this is a
+        // different visit (another phone or clinician). The phone must not treat
+        // it as its own: existingVisit.clientRequestId lets it tell the two apart.
         return res.status(409).json({
+          code: "VISIT_EXISTS_SAME_DAY",
           message: `A visit for this child already exists on ${formatDateOnly(visitDate)}. Open the existing visit instead of creating another one.`,
           existingVisit: {
             ...outVisit,
@@ -1716,7 +2024,11 @@ router.post(
             ]
           : [];
 
-      const result = await prisma.$transaction(async (tx) => {
+      let result;
+      try {
+      result = await prisma.$transaction(async (tx) => {
+        // Inserted first: a concurrent duplicate of this request blocks on the
+        // unique clientRequestId and then fails, rolling back before any stock moves.
         const createdVisit = await tx.childVisit.create({
           data: {
             childId: childCheck.id,
@@ -1729,6 +2041,7 @@ router.post(
             muacMm,
             whzScore,
             nextAppointmentDate,
+            clientRequestId,
           },
         });
 
@@ -1781,16 +2094,6 @@ router.post(
             throw e;
           }
 
-          const perBox = Number.isFinite(box.sachetsPerBox) ? box.sachetsPerBox : 600;
-          const remaining = Number.isFinite(box.sachetsRemaining) ? box.sachetsRemaining : perBox;
-          const newRemaining = remaining - Math.round(qty);
-          if (newRemaining < 0) {
-            const e = new Error("Not enough sachets remaining in this box");
-            e.statusCode = 400;
-            e.meta = { sachetsRemaining: remaining, requested: Math.round(qty), boxUid };
-            throw e;
-          }
-
           const d = await tx.dispense.create({
             data: {
               visitId: createdVisit.id,
@@ -1802,12 +2105,10 @@ router.post(
 
           createdDispenses.push(d);
 
-          await tx.box.update({
-            where: { id: box.id },
-            data: {
-              sachetsRemaining: newRemaining,
-              status: newRemaining === 0 ? "DISPENSED" : "IN_FACILITY",
-            },
+          const newRemaining = await takeSachetsFromBox(tx, {
+            boxId: box.id,
+            facilityId: childCheck.facilityId,
+            quantity: Math.round(qty),
           });
 
           await tx.boxEvent.create({
@@ -1823,6 +2124,13 @@ router.post(
 
         return { visit: createdVisit, dispenses: createdDispenses };
       });
+      } catch (err) {
+        if (clientRequestId && isUniqueViolationOn(err, "clientRequestId")) {
+          const replayed = await prisma.childVisit.findUnique({ where: { clientRequestId }, select: { id: true } });
+          if (replayed) return res.status(200).json(await buildVisitReplayPayload(replayed.id, childCheck));
+        }
+        throw err;
+      }
 
       const outVisit = addLegacyVisitFields(result.visit);
       const outDispenses = (result.dispenses || []).map((d) =>
@@ -1855,10 +2163,32 @@ router.patch(
       if (!childCheck) return res.status(404).json({ message: "Child not found" });
       if (childCheck === "FORBIDDEN") return res.status(403).json({ message: "Forbidden" });
 
-      const existingVisit = await prisma.childVisit.findUnique({
+      let existingVisit = await prisma.childVisit.findUnique({
         where: { id: req.params.visitId },
-        include: { dispenses: { include: { box: true } } },
+        include: VISIT_INCLUDE_FOR_EDIT,
       });
+
+      // Placeholder enrollment visit (see resolveEnrollmentVisitTarget): edit the
+      // real visit, or create it on first edit (createFromAssessment).
+      let createFromAssessment = null;
+      if (!existingVisit) {
+        const target = await resolveEnrollmentVisitTarget(req, childCheck, req.params.visitId);
+        if (target?.visit) {
+          existingVisit = target.visit;
+        } else if (target?.assessment) {
+          createFromAssessment = target.assessment;
+          existingVisit = {
+            id: null,
+            childId: childCheck.id,
+            facilityId: childCheck.facilityId,
+            visitDate: target.assessment.assessmentDate,
+            nextAppointmentDate: null,
+            notes: "Enrollment visit",
+            ...extractAssessmentVisitMetrics(target.assessment.data),
+            dispenses: [],
+          };
+        }
+      }
 
       if (!existingVisit || existingVisit.childId !== childCheck.id || existingVisit.facilityId !== childCheck.facilityId) {
         return res.status(404).json({ message: "Visit not found for this child" });
@@ -1942,11 +2272,34 @@ router.patch(
         newQuantitySachets = Math.round(qty);
       }
 
-      const updated = await prisma.$transaction(async (tx) => {
-        const latestVisit = await tx.childVisit.findUnique({
-          where: { id: existingVisit.id },
-          include: { dispenses: { include: { box: true } } },
-        });
+      const clientRequestId = createFromAssessment ? clientRequestIdFrom(req) : null;
+      let updated;
+      try {
+      updated = await prisma.$transaction(async (tx) => {
+        // First edit of a placeholder enrollment visit: create the real visit.
+        // clientRequestId makes a replay of this edit find it instead of
+        // creating another one.
+        const latestVisit = createFromAssessment
+          ? await tx.childVisit.create({
+              data: {
+                childId: childCheck.id,
+                facilityId: childCheck.facilityId,
+                performedByUserId: req.user.id,
+                visitDate,
+                notes,
+                weightKg,
+                heightCm,
+                muacMm,
+                whzScore,
+                nextAppointmentDate,
+                clientRequestId,
+              },
+              include: VISIT_INCLUDE_FOR_EDIT,
+            })
+          : await tx.childVisit.findUnique({
+              where: { id: existingVisit.id },
+              include: VISIT_INCLUDE_FOR_EDIT,
+            });
 
         if (!latestVisit) {
           const e = new Error("Visit not found for this child");
@@ -1996,6 +2349,24 @@ router.patch(
 
         return { visit: updatedVisit, dispenses, reversedDispenses };
       });
+      } catch (err) {
+        // A concurrent copy of this edit created the visit first: return it.
+        if (clientRequestId && isUniqueViolationOn(err, "clientRequestId")) {
+          const winner = await prisma.childVisit.findUnique({ where: { clientRequestId }, include: { dispenses: true } });
+          if (winner) {
+            return res.json({
+              message: "Visit updated (replay)",
+              replayed: true,
+              visit: {
+                ...addLegacyVisitFields(winner),
+                dispenses: winner.dispenses.map((d) => addLegacyDispenseFields(d, winner, childCheck)),
+              },
+              reversedDispenses: [],
+            });
+          }
+        }
+        throw err;
+      }
 
       const outVisit = addLegacyVisitFields({ ...updated.visit, dispenses: updated.dispenses });
       const outDispenses = (updated.dispenses || []).map((d) => addLegacyDispenseFields(d, updated.visit, childCheck));
@@ -2109,8 +2480,7 @@ router.post(
 
       const perBox = Number.isFinite(box.sachetsPerBox) ? box.sachetsPerBox : 600;
       const remaining = Number.isFinite(box.sachetsRemaining) ? box.sachetsRemaining : perBox;
-      const newRemaining = remaining - Math.round(quantitySachets);
-      if (newRemaining < 0) {
+      if (remaining - Math.round(quantitySachets) < 0) {
         return res.status(400).json({
           message: "Not enough sachets remaining in this box",
           sachetsRemaining: remaining,
@@ -2129,12 +2499,12 @@ router.post(
           },
         });
 
-        await tx.box.update({
-          where: { id: box.id },
-          data: {
-            sachetsRemaining: newRemaining,
-            status: newRemaining === 0 ? "DISPENSED" : "IN_FACILITY",
-          },
+        // The check above is only a fast path; this conditional decrement is
+        // what actually guards the balance against concurrent dispenses.
+        const newRemaining = await takeSachetsFromBox(tx, {
+          boxId: box.id,
+          facilityId: childCheck.facilityId,
+          quantity: Math.round(quantitySachets),
         });
 
         await tx.boxEvent.create({
@@ -2217,11 +2587,27 @@ router.post(
       const assessmentType =
         normalizeAssessmentType(req.query.type ?? body.assessmentType ?? body.type) || "ENROLLMENT";
 
+      // Replay of a request we already processed (lost response): return it.
+      const clientRequestId = clientRequestIdFrom(req);
+      if (clientRequestId) {
+        const replayed = await prisma.inDepthAssessment.findUnique({ where: { clientRequestId } });
+        if (replayed && replayed.childId === childCheck.id) {
+          return res.status(200).json({
+            message: "In-depth assessment already saved (replay)",
+            replayed: true,
+            assessment: addLegacyAssessmentFields(replayed),
+          });
+        }
+      }
+
+      // One assessment per type per child. `assessment.clientRequestId` tells
+      // the phone whether the existing record is its own (older records: null).
       const existing = await prisma.inDepthAssessment.findUnique({
         where: { childId_assessmentType: { childId: childCheck.id, assessmentType } },
       });
       if (existing) {
         return res.status(409).json({
+          code: "ASSESSMENT_EXISTS",
           message: `In-depth assessment already exists for this child (${assessmentType})`,
           assessment: existing,
         });
@@ -2243,17 +2629,49 @@ router.post(
       const enrichedData = enrichAssessmentData(normalized.data);
       const quick = extractAssessmentQuickFields(enrichedData);
 
-      const assessment = await prisma.inDepthAssessment.create({
-        data: {
-          childId: childCheck.id,
-          facilityId: childCheck.facilityId,
-          performedByUserId: req.user.id,
-          assessmentType,
-          assessmentDate: normalized.assessmentDate,
-          data: enrichedData,
-          ...quick,
-        },
-      });
+      let assessment;
+      try {
+        assessment = await prisma.$transaction(async (tx) => {
+          const created = await tx.inDepthAssessment.create({
+            data: {
+              childId: childCheck.id,
+              facilityId: childCheck.facilityId,
+              performedByUserId: req.user.id,
+              assessmentType,
+              assessmentDate: normalized.assessmentDate,
+              data: enrichedData,
+              clientRequestId,
+              ...quick,
+            },
+          });
+          // Bump child.updatedAt so facility delta sync pulls this assessment to other phones.
+          await tx.child.update({ where: { id: childCheck.id }, data: { updatedAt: new Date() } });
+          return created;
+        });
+      } catch (err) {
+        // Lost a race with a concurrent copy of this request, or with another
+        // device saving the same assessment type.
+        if (err?.code === "P2002") {
+          const winner = await prisma.inDepthAssessment.findUnique({
+            where: { childId_assessmentType: { childId: childCheck.id, assessmentType } },
+          });
+          if (winner && clientRequestId && winner.clientRequestId === clientRequestId) {
+            return res.status(200).json({
+              message: "In-depth assessment already saved (replay)",
+              replayed: true,
+              assessment: addLegacyAssessmentFields(winner),
+            });
+          }
+          if (winner) {
+            return res.status(409).json({
+              code: "ASSESSMENT_EXISTS",
+              message: `In-depth assessment already exists for this child (${assessmentType})`,
+              assessment: winner,
+            });
+          }
+        }
+        throw err;
+      }
 
       return res.status(201).json({ message: "In-depth assessment saved", assessment: addLegacyAssessmentFields(assessment) });
     } catch (err) {
@@ -2340,14 +2758,19 @@ router.put(
       dataObj = enrichAssessmentData(dataObj);
       const quick = extractAssessmentQuickFields(dataObj);
 
-      const updated = await prisma.inDepthAssessment.update({
-        where: { id: existing.id },
-        data: {
-          assessmentDate,
-          data: dataObj,
-          performedByUserId: req.user.id,
-          ...quick,
-        },
+      const updated = await prisma.$transaction(async (tx) => {
+        const row = await tx.inDepthAssessment.update({
+          where: { id: existing.id },
+          data: {
+            assessmentDate,
+            data: dataObj,
+            performedByUserId: req.user.id,
+            ...quick,
+          },
+        });
+        // Bump child.updatedAt so facility delta sync pulls the edit to other phones.
+        await tx.child.update({ where: { id: childCheck.id }, data: { updatedAt: new Date() } });
+        return row;
       });
 
       return res.json({ message: "In-depth assessment updated", assessment: addLegacyAssessmentFields(updated) });
@@ -2374,25 +2797,24 @@ router.get(
         return res.status(400).json({ message: "date must be a valid date (YYYY-MM-DD)" });
       }
 
-      const children = await prisma.child.findMany({
-        where: { facilityId: facility.id },
-        include: {
-          caregiver: true,
-          facility: true,
-          inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
-          visits: {
-            orderBy: { visitDate: "desc" },
-            include: {
-              dispenses: {
-                orderBy: { createdAt: "desc" },
-                include: { box: true },
-              },
-            },
-          },
-        },
-        orderBy: { updatedAt: "desc" },
-        take: 1000,
-      });
+      // Only children with an appointment booked for this day can appear, so
+      // find them first instead of loading (and truncating) the whole facility.
+      const dayEnd = new Date(target);
+      dayEnd.setDate(dayEnd.getDate() + 1);
+      const candidateIds = (
+        await prisma.childVisit.findMany({
+          where: { facilityId: facility.id, nextAppointmentDate: { gte: target, lt: dayEnd } },
+          select: { childId: true },
+          distinct: ["childId"],
+        })
+      ).map((r) => r.childId);
+
+      const children = candidateIds.length
+        ? await prisma.child.findMany({
+            where: { facilityId: facility.id, id: { in: candidateIds } },
+            include: CHILD_SUMMARY_INCLUDE,
+          })
+        : [];
 
       const today = startOfDay(new Date());
       const rows = [];
@@ -2480,20 +2902,46 @@ router.get(
         return res.status(400).json({ message: "date must be a valid date (YYYY-MM-DD)" });
       }
 
-      const children = await prisma.child.findMany({
-        where: { facilityId: facility.id },
-        include: {
-          caregiver: true,
-          facility: true,
-          visits: {
-            orderBy: { visitDate: "desc" },
-            include: { dispenses: { orderBy: { createdAt: "desc" } } },
-          },
-          inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
+      const include = {
+        caregiver: true,
+        facility: true,
+        visits: {
+          orderBy: { visitDate: "desc" },
+          include: { dispenses: { orderBy: { createdAt: "desc" } } },
         },
-        orderBy: { updatedAt: "desc" },
-        take: 1000,
-      });
+        inDepthAssessments: { orderBy: { assessmentDate: "desc" } },
+      };
+
+      let children;
+      if (target) {
+        // For a specific day, only children with activity that day qualify:
+        // look them up directly instead of scanning (and truncating) the facility.
+        const dayEnd = new Date(target);
+        dayEnd.setDate(dayEnd.getDate() + 1);
+        const onDay = { gte: target, lt: dayEnd };
+        const [visitRows, assessmentRows, enrolledRows] = await Promise.all([
+          prisma.childVisit.findMany({ where: { facilityId: facility.id, visitDate: onDay }, select: { childId: true }, distinct: ["childId"] }),
+          prisma.inDepthAssessment.findMany({ where: { facilityId: facility.id, assessmentDate: onDay }, select: { childId: true }, distinct: ["childId"] }),
+          prisma.child.findMany({ where: { facilityId: facility.id, enrollmentDate: onDay }, select: { id: true } }),
+        ]);
+        const ids = [
+          ...new Set([
+            ...visitRows.map((r) => r.childId),
+            ...assessmentRows.map((r) => r.childId),
+            ...enrolledRows.map((r) => r.id),
+          ]),
+        ];
+        children = ids.length
+          ? await prisma.child.findMany({ where: { facilityId: facility.id, id: { in: ids } }, include })
+          : [];
+      } else {
+        children = await prisma.child.findMany({
+          where: { facilityId: facility.id },
+          include,
+          orderBy: { updatedAt: "desc" },
+          take: 1000,
+        });
+      }
 
       const rows = [];
 
@@ -2577,7 +3025,7 @@ router.get(
         return res.status(400).json({ message: "Your user has no facility assigned" });
       }
 
-      const serverTime = new Date();
+      const serverNow = new Date();
       const takeRaw = Number(req.query.take || 500);
       const take = Number.isFinite(takeRaw) ? Math.max(1, Math.min(1000, Math.round(takeRaw))) : 500;
 
@@ -2588,69 +3036,78 @@ router.get(
           return res.status(400).json({ message: "since must be a valid ISO date/time" });
         }
       }
+      const sinceId = since && req.query.sinceId ? String(req.query.sinceId) : null;
 
+      // Every clinical write bumps Child.updatedAt, so the delta is an ordered
+      // read of children by (updatedAt, id). Paging oldest-first with a cursor
+      // means nothing is skipped when more than `take` children changed.
+      // With sinceId the cursor is exact; without it (older app builds) rows at
+      // exactly `since` are re-sent, which is harmless because import is idempotent.
       const where = { facilityId: facility.id };
-
       if (since) {
-        const changedVisitChildIds = await prisma.childVisit.findMany({
-          where: {
-            facilityId: facility.id,
-            OR: [
-              { createdAt: { gt: since } },
-              { visitDate: { gt: since } },
-            ],
-          },
-          select: { childId: true },
-          distinct: ["childId"],
-          take,
-        });
+        where.OR = sinceId
+          ? [{ updatedAt: { gt: since } }, { updatedAt: since, id: { gt: sinceId } }]
+          : [{ updatedAt: { gte: since } }];
+      }
 
-        const changedAssessmentChildIds = await prisma.inDepthAssessment.findMany({
-          where: {
-            facilityId: facility.id,
-            OR: [
-              { createdAt: { gt: since } },
-              { updatedAt: { gt: since } },
-              { assessmentDate: { gt: since } },
-            ],
-          },
-          select: { childId: true },
-          distinct: ["childId"],
-          take,
-        });
+      const rows = await prisma.child.findMany({
+        where,
+        select: { id: true, updatedAt: true },
+        orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+        take: take + 1,
+      });
+      const hasMore = rows.length > take;
+      const page = rows.slice(0, take);
+      const childIds = page.map((r) => r.id);
 
-        const changedChildIds = [
-          ...changedVisitChildIds.map((v) => v.childId),
-          ...changedAssessmentChildIds.map((a) => a.childId),
-        ];
-
-        where.OR = [
-          { updatedAt: { gt: since } },
-          { createdAt: { gt: since } },
-        ];
-
-        if (changedChildIds.length) {
-          where.OR.push({ id: { in: Array.from(new Set(changedChildIds)) } });
+      // Records written before assessments bumped Child.updatedAt can only be
+      // found through their own timestamps. Add them on the final page so they
+      // never disturb the cursor.
+      if (since && !hasMore) {
+        const seen = new Set(childIds);
+        const [legacyVisits, legacyAssessments] = await Promise.all([
+          prisma.childVisit.findMany({
+            where: { facilityId: facility.id, createdAt: { gt: since } },
+            select: { childId: true },
+            distinct: ["childId"],
+            take,
+          }),
+          prisma.inDepthAssessment.findMany({
+            where: { facilityId: facility.id, OR: [{ createdAt: { gt: since } }, { updatedAt: { gt: since } }] },
+            select: { childId: true },
+            distinct: ["childId"],
+            take,
+          }),
+        ]);
+        for (const r of [...legacyVisits, ...legacyAssessments]) {
+          if (!seen.has(r.childId)) {
+            seen.add(r.childId);
+            childIds.push(r.childId);
+          }
         }
       }
 
-      const changedChildren = await prisma.child.findMany({
-        where,
-        select: { id: true, updatedAt: true, createdAt: true },
-        orderBy: { updatedAt: "desc" },
-        take,
-      });
+      const children = await buildChildSummaryPayloads(childIds);
 
-      const children = [];
-      for (const row of changedChildren) {
-        const summary = await buildChildSummaryPayload(row.id);
-        if (summary) children.push(summary);
-      }
+      // Where the next pull should start.
+      // - More pages: continue from the last row returned.
+      // - Final page: restart a little before this request began, so a write
+      //   whose timestamp was taken before the query but committed after it is
+      //   still picked up next time (re-sent rows are harmless).
+      const last = page[page.length - 1];
+      const nextSince = hasMore ? last.updatedAt : new Date(serverNow.getTime() - DELTA_SAFETY_WINDOW_MS);
+      const nextSinceId = hasMore ? last.id : null;
 
       return res.json({
         facility: { id: facility.id, code: facility.code, name: facility.name },
         since: since ? since.toISOString() : null,
-        serverTime: serverTime.toISOString(),
+        // Older app builds store `serverTime` as their next `since`, so it carries
+        // the cursor; that alone makes them page forward on successive pulls.
+        serverTime: nextSince.toISOString(),
+        serverNow: serverNow.toISOString(),
+        nextSince: nextSince.toISOString(),
+        nextSinceId,
+        hasMore,
         count: children.length,
         children,
       });

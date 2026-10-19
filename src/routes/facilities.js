@@ -4,6 +4,7 @@ const router = express.Router();
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
 const { requireRole } = require("../middleware/rbac");
+const { countryWideImplementationId, locationWithDescendants } = require("../auth/access");
 
 function normalizeType(type) {
   if (!type) return "FACILITY";
@@ -61,6 +62,8 @@ router.post("/", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
         name: String(name).trim(),
         type: facilityType,
         implementationId: effectiveImplementationId,
+        stockLocationType: facilityType === "WAREHOUSE" ? "CENTRAL_WAREHOUSE" : "CLINIC_STORE",
+        parentStockLocationId: facilityType === "FACILITY" ? (warehouseId ? String(warehouseId) : null) : null,
         warehouseId: facilityType === "FACILITY" ? (warehouseId ? String(warehouseId) : null) : null,
       },
     });
@@ -113,7 +116,7 @@ router.patch(
 
       const updated = await prisma.facility.update({
         where: { id: facility.id },
-        data: { warehouseId: wh.id },
+        data: { warehouseId: wh.id, parentStockLocationId: wh.id },
         include: { warehouse: true },
       });
 
@@ -208,7 +211,7 @@ router.patch(
       const idsToUpdate = facilities.map((f) => f.id);
       const result = await prisma.facility.updateMany({
         where: { id: { in: idsToUpdate } },
-        data: { warehouseId: wh.id },
+        data: { warehouseId: wh.id, parentStockLocationId: wh.id },
       });
 
       return res.json({
@@ -242,11 +245,22 @@ router.get("/", requireAuth, async (req, res) => {
     if (req.user.role === "SUPER_ADMIN") {
       const where = {};
       if (type) where.type = type;
+      // Optional: only one country/programme's locations (e.g. when adding a user).
+      if (req.query.implementationId) where.implementationId = String(req.query.implementationId);
 
       const facilities = await prisma.facility.findMany({
         where,
         orderBy: [{ type: "asc" }, { name: "asc" }],
       });
+      return res.json(facilities);
+    }
+
+    // COUNTRY_ADMIN or a country-wide VIEWER: every location in their country
+    const countryId = countryWideImplementationId(req.user);
+    if (countryId) {
+      const where = { implementationId: countryId };
+      if (type) where.type = type;
+      const facilities = await prisma.facility.findMany({ where, orderBy: [{ type: "asc" }, { name: "asc" }] });
       return res.json(facilities);
     }
 
@@ -257,13 +271,26 @@ router.get("/", requireAuth, async (req, res) => {
       const assigned = await prisma.facility.findUnique({ where: { id: req.user.facilityId } });
       if (!assigned) return res.json([]);
 
+      // A viewer on a warehouse reads everything below it (main warehouse ->
+      // field bases -> sites).
+      if (assigned.type === "WAREHOUSE" && req.user.role === "VIEWER") {
+        const ids = await locationWithDescendants(assigned.id);
+        const where = { id: { in: ids } };
+        if (type) where.type = type;
+        const facilities = await prisma.facility.findMany({ where, orderBy: [{ type: "asc" }, { name: "asc" }] });
+        return res.json(facilities);
+      }
+
       // If assigned to warehouse: show warehouse + its facilities (good for dashboard viewer)
       if (assigned.type === "WAREHOUSE") {
         if (type === "WAREHOUSE") return res.json([assigned]);
 
         if (type === "FACILITY") {
           const facilities = await prisma.facility.findMany({
-            where: { type: "FACILITY", warehouseId: assigned.id },
+            where: {
+              type: "FACILITY",
+              OR: [{ warehouseId: assigned.id }, { parentStockLocationId: assigned.id }],
+            },
             orderBy: [{ name: "asc" }],
           });
           return res.json(facilities);
@@ -271,7 +298,7 @@ router.get("/", requireAuth, async (req, res) => {
 
         const facilities = await prisma.facility.findMany({
           where: {
-            OR: [{ id: assigned.id }, { warehouseId: assigned.id }],
+            OR: [{ id: assigned.id }, { warehouseId: assigned.id }, { parentStockLocationId: assigned.id }],
           },
           orderBy: [{ type: "asc" }, { name: "asc" }],
         });

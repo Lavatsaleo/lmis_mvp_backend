@@ -3,6 +3,9 @@ const router = express.Router();
 
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
+// Children, reports and duplicate cases are CLINICAL; stock views are open to all modules.
+const { requireModule } = require("../middleware/modules");
+const { countryWideImplementationId, locationWithDescendants } = require("../auth/access");
 
 // ---------------- helpers ----------------
 function toInt(v, fallback) {
@@ -18,11 +21,161 @@ function getActiveDayKey(d) {
   return startOfDay(d).getTime();
 }
 
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// A facility+product that dispensed within this many days but now has no stock
+// is reported as stocked out, even if it has not dispensed in the consumption
+// window (it cannot dispense with nothing on hand).
+const STOCKOUT_LOOKBACK_DAYS = 90;
+
+/**
+ * Consumption-based stock position per facility+product.
+ *
+ * avgDaily = sachets dispensed in the last `days` days / calendar days observed.
+ * Dividing by calendar days (not just days with dispensing) matters for clinics
+ * that dispense one or two days a week; otherwise their usage is overstated
+ * 5-7x. Observation starts at the first dispense if the pair only began
+ * dispensing inside the window, so new facilities are not understated either.
+ *
+ * facilityFilter: undefined (all) | facilityId string | { in: [...] }.
+ * Returns one row per pair seen dispensing in the lookback period.
+ */
+async function computeStockPositions({ facilityFilter, days, today }) {
+  const windowStart = new Date(today.getTime() - days * MS_PER_DAY);
+  const lookbackDays = Math.max(days, STOCKOUT_LOOKBACK_DAYS);
+  const lookbackStart = new Date(today.getTime() - lookbackDays * MS_PER_DAY);
+  const tomorrow = new Date(today.getTime() + MS_PER_DAY);
+
+  const visitWhere = { visitDate: { gte: lookbackStart } };
+  if (facilityFilter !== undefined) visitWhere.facilityId = facilityFilter;
+
+  const [dispenses, stockAgg] = await Promise.all([
+    prisma.dispense.findMany({
+      where: { boxId: { not: null }, visit: visitWhere },
+      select: {
+        quantitySachets: true,
+        visit: { select: { facilityId: true, visitDate: true } },
+        box: { select: { productId: true } },
+      },
+      take: 200000,
+    }),
+    prisma.box.groupBy({
+      by: ["currentFacilityId", "productId"],
+      where: {
+        status: "IN_FACILITY",
+        ...(facilityFilter !== undefined ? { currentFacilityId: facilityFilter } : {}),
+      },
+      _count: { _all: true },
+      _sum: { sachetsRemaining: true },
+    }),
+  ]);
+
+  const pairs = new Map();
+  for (const d of dispenses) {
+    const facilityId = d.visit?.facilityId;
+    const productId = d.box?.productId;
+    const visitDate = d.visit?.visitDate;
+    if (!facilityId || !productId || !visitDate) continue;
+
+    const key = `${facilityId}__${productId}`;
+    if (!pairs.has(key)) {
+      pairs.set(key, { facilityId, productId, windowDispensed: 0, firstDispense: visitDate, activeDays: new Set() });
+    }
+    const p = pairs.get(key);
+    if (visitDate < p.firstDispense) p.firstDispense = visitDate;
+    if (visitDate >= windowStart) {
+      p.windowDispensed += Number(d.quantitySachets) || 0;
+      p.activeDays.add(getActiveDayKey(visitDate));
+    }
+  }
+
+  const stockMap = new Map(
+    stockAgg.map((r) => [
+      `${r.currentFacilityId}__${r.productId}`,
+      { onHand: r._sum.sachetsRemaining || 0, boxes: r._count._all || 0 },
+    ])
+  );
+
+  return [...pairs.entries()].map(([key, p]) => {
+    const stock = stockMap.get(key) || { onHand: 0, boxes: 0 };
+    const observedFrom = p.firstDispense > windowStart ? startOfDay(p.firstDispense) : windowStart;
+    const consumptionDays = Math.max(1, Math.min(days, Math.round((tomorrow - observedFrom) / MS_PER_DAY)));
+    const avgDaily = p.windowDispensed / consumptionDays;
+    const daysOfStock = avgDaily > 0 ? stock.onHand / avgDaily : stock.onHand === 0 ? 0 : null;
+
+    return {
+      facilityId: p.facilityId,
+      productId: p.productId,
+      onHand: stock.onHand,
+      boxesOnHand: stock.boxes,
+      avgDaily,
+      daysOfStock,
+      consumptionDays,
+      activeDispensingDays: p.activeDays.size,
+      stockedOut: stock.onHand === 0,
+    };
+  });
+}
+
+// Pairs at or below the threshold, most urgent first.
+function riskRowsFrom(positions, stockoutThresholdDays) {
+  return positions
+    .filter((r) => r.daysOfStock !== null && Number.isFinite(r.daysOfStock) && r.daysOfStock <= stockoutThresholdDays)
+    .sort((a, b) => a.daysOfStock - b.daysOfStock);
+}
+
+function stockRiskPayload(r, facility, product) {
+  return {
+    facility: facility || { id: r.facilityId },
+    product: product || { id: r.productId },
+    onHandSachets: r.onHand,
+    activeDispensingDays: r.activeDispensingDays,
+    consumptionDays: r.consumptionDays,
+    stockedOut: r.stockedOut,
+    avgDailyDispense: Number(r.avgDaily.toFixed(2)),
+    daysOfStock: Number(r.daysOfStock.toFixed(1)),
+  };
+}
+
+// Display name for stock quantities on dashboard pages. Quantities are in each
+// product's base unit (sachet, tablet...); when every product in scope uses the
+// same one, show its name, otherwise a neutral "Unit".
+async function stockUnitFor(req) {
+  const where = { isActive: true };
+  if (req.user?.role !== "SUPER_ADMIN" && req.user?.implementationId) {
+    where.implementationId = req.user.implementationId;
+  }
+  const rows = await prisma.product.findMany({ where, select: { baseUnitName: true }, distinct: ["baseUnitName"] });
+  const names = [...new Set(rows.map((r) => String(r.baseUnitName || "").trim()).filter(Boolean))];
+  const singular = names.length === 1 ? names[0] : "Unit";
+  return { singular, plural: /s$/i.test(singular) ? singular : `${singular}s` };
+}
+
+async function lookupFacilitiesAndProducts(rows) {
+  const facilityIds = [...new Set(rows.map((r) => r.facilityId))];
+  const productIds = [...new Set(rows.map((r) => r.productId))];
+  const [facilities, products] = await Promise.all([
+    prisma.facility.findMany({ where: { id: { in: facilityIds } }, select: { id: true, code: true, name: true } }),
+    prisma.product.findMany({ where: { id: { in: productIds } }, select: { id: true, code: true, name: true } }),
+  ]);
+  return {
+    facilityMap: new Map(facilities.map((f) => [f.id, f])),
+    productMap: new Map(products.map((p) => [p.id, p])),
+  };
+}
+
 /**
  * Scope rules (safe, won’t leak):
- * - SUPER_ADMIN or VIEWER => ALL
- * - WAREHOUSE_OFFICER or assigned to WAREHOUSE => warehouse + its facilities
- * - otherwise => only own facility
+ * - SUPER_ADMIN => ALL (every warehouse, every implementation)
+ * - COUNTRY_ADMIN, or a VIEWER with a country but no location => every
+ *   location in that implementation (mode WAREHOUSE over all its warehouses)
+ * - Anyone assigned to a WAREHOUSE (WAREHOUSE_OFFICER, or a VIEWER placed on a
+ *   warehouse) => that warehouse + every location below it (field bases and
+ *   their sites; in Kenya's one-level setup, the warehouse + its facilities)
+ * - Anyone assigned to a FACILITY (including a VIEWER) => only that facility
+ * - No assignment => nothing
+ * In WAREHOUSE mode `warehouseIds` lists every warehouse in scope (stock held
+ * there, shipments in and out); `warehouseId` is the assigned one, if any.
  */
 async function getScope(req) {
   const role = req.user?.role;
@@ -31,7 +184,15 @@ async function getScope(req) {
   const warehouseId =
     req.user?.warehouseId ? String(req.user.warehouseId) : facilityId;
 
-  if (role === "SUPER_ADMIN" || role === "VIEWER") {
+  const NONE = {
+    mode: "NONE",
+    warehouseId: null,
+    warehouseIds: [],
+    facilityIdsAll: [],
+    facilityIdsFacilitiesOnly: [],
+  };
+
+  if (role === "SUPER_ADMIN") {
     // ALL facilities
     const facs = await prisma.facility.findMany({
       where: { type: "FACILITY" },
@@ -40,49 +201,48 @@ async function getScope(req) {
     return {
       mode: "ALL",
       warehouseId: null,
+      warehouseIds: null,
       facilityIdsAll: null, // null means “no restriction”
       facilityIdsFacilitiesOnly: facs.map((f) => f.id),
     };
   }
 
-  // Warehouse scope
-  if (role === "WAREHOUSE_OFFICER" || facilityType === "WAREHOUSE") {
-    if (!warehouseId) {
-      return {
-        mode: "NONE",
-        warehouseId: null,
-        facilityIdsAll: [],
-        facilityIdsFacilitiesOnly: [],
-      };
-    }
+  const scopeFrom = (locations, assignedWarehouseId) => ({
+    mode: "WAREHOUSE",
+    warehouseId: assignedWarehouseId,
+    warehouseIds: locations.filter((f) => f.type === "WAREHOUSE").map((f) => f.id),
+    facilityIdsAll: locations.map((f) => f.id),
+    facilityIdsFacilitiesOnly: locations.filter((f) => f.type === "FACILITY").map((f) => f.id),
+  });
 
-    const facilities = await prisma.facility.findMany({
-      where: { OR: [{ id: warehouseId }, { warehouseId }] },
+  // Whole country
+  const countryId = countryWideImplementationId(req.user);
+  if (countryId) {
+    const locations = await prisma.facility.findMany({
+      where: { implementationId: countryId },
       select: { id: true, type: true },
     });
+    return scopeFrom(locations, null);
+  }
 
-    return {
-      mode: "WAREHOUSE",
-      warehouseId,
-      facilityIdsAll: facilities.map((f) => f.id),
-      facilityIdsFacilitiesOnly: facilities
-        .filter((f) => f.type === "FACILITY")
-        .map((f) => f.id),
-    };
+  // Warehouse scope
+  if (role === "WAREHOUSE_OFFICER" || facilityType === "WAREHOUSE") {
+    if (!warehouseId) return NONE;
+
+    const ids = await locationWithDescendants(warehouseId);
+    const locations = await prisma.facility.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, type: true },
+    });
+    return scopeFrom(locations, warehouseId);
   }
 
   // Facility scope (clinician / facility officer etc.)
-  if (!facilityId) {
-    return {
-      mode: "NONE",
-      warehouseId: null,
-      facilityIdsAll: [],
-      facilityIdsFacilitiesOnly: [],
-    };
-  }
+  if (!facilityId) return NONE;
   return {
     mode: "FACILITY",
     warehouseId: null,
+    warehouseIds: [],
     facilityIdsAll: [facilityId],
     facilityIdsFacilitiesOnly: [facilityId],
   };
@@ -125,14 +285,23 @@ router.get("/overview", requireAuth, async (req, res) => {
     }
 
     let boxesInWarehouse = 0;
-    if (scope.mode === "ALL") {
-      boxesInWarehouse = await prisma.box.count({
-        where: { status: "IN_WAREHOUSE" },
+    let sachetsInWarehouse = 0;
+    const warehouseBoxWhere =
+      scope.mode === "ALL"
+        ? { status: "IN_WAREHOUSE" }
+        : scope.mode === "WAREHOUSE" && scope.warehouseIds.length
+        ? { status: "IN_WAREHOUSE", currentFacilityId: { in: scope.warehouseIds } }
+        : null;
+    if (warehouseBoxWhere) {
+      // Summed from the boxes themselves: pack sizes are configurable, so
+      // boxes x 600 is no longer a valid estimate.
+      const warehouseAgg = await prisma.box.aggregate({
+        where: warehouseBoxWhere,
+        _count: { _all: true },
+        _sum: { sachetsRemaining: true },
       });
-    } else if (scope.mode === "WAREHOUSE" && scope.warehouseId) {
-      boxesInWarehouse = await prisma.box.count({
-        where: { status: "IN_WAREHOUSE", currentFacilityId: scope.warehouseId },
-      });
+      boxesInWarehouse = warehouseAgg._count._all || 0;
+      sachetsInWarehouse = warehouseAgg._sum.sachetsRemaining || 0;
     }
 
     const facilityBoxWhere = {
@@ -150,7 +319,6 @@ router.get("/overview", requireAuth, async (req, res) => {
       _sum: { sachetsRemaining: true },
     });
     const sachetsInFacilities = sachetsInFacilitiesAgg._sum.sachetsRemaining || 0;
-    const sachetsInWarehouse = boxesInWarehouse * 600;
 
     const facilityAgg = await prisma.box.groupBy({
       by: ["currentFacilityId"],
@@ -184,15 +352,13 @@ router.get("/overview", requireAuth, async (req, res) => {
         (a.facilityName || "").localeCompare(b.facilityName || "")
       );
 
-    let boxesInTransit = 0;
-    let transitTo = [];
-
     const shipWhere = selectedFacilityId
       ? { status: "DISPATCHED", toFacilityId: selectedFacilityId }
       : scope.mode === "ALL"
       ? { status: "DISPATCHED" }
       : scope.mode === "WAREHOUSE"
-      ? { status: "DISPATCHED", fromWarehouseId: scope.warehouseId }
+      ? // Outgoing, plus transfers coming in (a field base awaiting stock).
+        { status: "DISPATCHED", OR: [{ fromWarehouseId: { in: scope.warehouseIds } }, { toFacilityId: { in: scope.warehouseIds } }] }
       : scope.mode === "FACILITY"
       ? {
           status: "DISPATCHED",
@@ -200,23 +366,24 @@ router.get("/overview", requireAuth, async (req, res) => {
         }
       : { status: "DISPATCHED", id: "__none__" };
 
-    const activeShipments = await prisma.shipment.findMany({
-      where: shipWhere,
-      orderBy: { dispatchedAt: "desc" },
-      take: 100,
-      include: {
-        toFacility: { select: { id: true, code: true, name: true } },
-        fromWarehouse: { select: { id: true, code: true, name: true } },
-        _count: { select: { items: true } },
-      },
-    });
+    // A shipment stays DISPATCHED until its last box is received, so count only
+    // items not yet received, and count them across all open shipments (the
+    // list below is capped for display, the KPI is not).
+    const [boxesInTransit, activeShipments] = await Promise.all([
+      prisma.shipmentItem.count({ where: { receivedAt: null, shipment: shipWhere } }),
+      prisma.shipment.findMany({
+        where: shipWhere,
+        orderBy: { dispatchedAt: "desc" },
+        take: 100,
+        include: {
+          toFacility: { select: { id: true, code: true, name: true } },
+          fromWarehouse: { select: { id: true, code: true, name: true } },
+          _count: { select: { items: { where: { receivedAt: null } } } },
+        },
+      }),
+    ]);
 
-    boxesInTransit = activeShipments.reduce(
-      (sum, s) => sum + (s._count.items || 0),
-      0
-    );
-
-    transitTo = activeShipments.map((s) => ({
+    const transitTo = activeShipments.map((s) => ({
       shipmentId: s.id,
       manifestNo: s.manifestNo,
       dispatchedAt: s.dispatchedAt,
@@ -266,123 +433,34 @@ router.get("/overview", requireAuth, async (req, res) => {
     const windowStart = new Date(today);
     windowStart.setDate(windowStart.getDate() - days);
 
-    const dispenses = await prisma.dispense.findMany({
-      where: {
-        boxId: { not: null },
-        visit: selectedFacilityId
-          ? { facilityId: selectedFacilityId, visitDate: { gte: windowStart } }
-          : scope.mode === "ALL"
-          ? { visitDate: { gte: windowStart } }
-          : {
-              facilityId: { in: scope.facilityIdsFacilitiesOnly },
-              visitDate: { gte: windowStart },
-            },
-      },
-      select: {
-        quantitySachets: true,
-        visit: { select: { facilityId: true, visitDate: true } },
-        box: { select: { productId: true } },
-      },
-      take: 50000,
-    });
+    const facilityFilter = selectedFacilityId
+      ? selectedFacilityId
+      : scope.mode === "ALL"
+      ? undefined
+      : { in: scope.facilityIdsFacilitiesOnly };
 
-    const sachetsDispensed = dispenses.reduce(
-      (sum, d) => sum + (Number(d.quantitySachets) || 0),
-      0
-    );
-
-    const usageMap = new Map();
-    const activeDaysMap = new Map();
-
-    for (const d of dispenses) {
-      const facilityId = d.visit?.facilityId;
-      const productId = d.box?.productId;
-      const visitDate = d.visit?.visitDate;
-      if (!facilityId || !productId || !visitDate) continue;
-
-      const key = `${facilityId}__${productId}`;
-      usageMap.set(
-        key,
-        (usageMap.get(key) || 0) + (Number(d.quantitySachets) || 0)
-      );
-
-      if (!activeDaysMap.has(key)) activeDaysMap.set(key, new Set());
-      activeDaysMap.get(key).add(getActiveDayKey(visitDate));
-    }
-
-    const stockRows = await prisma.box.findMany({
-      where: {
-        status: "IN_FACILITY",
-        currentFacilityId: selectedFacilityId
-          ? selectedFacilityId
-          : scope.mode === "ALL"
-          ? undefined
-          : { in: scope.facilityIdsFacilitiesOnly },
-      },
-      select: { sachetsRemaining: true, currentFacilityId: true, productId: true },
-      take: 50000,
-    });
-
-    const stockMap = new Map();
-    for (const r of stockRows) {
-      const key = `${r.currentFacilityId}__${r.productId}`;
-      stockMap.set(key, (stockMap.get(key) || 0) + (r.sachetsRemaining || 0));
-    }
-
-    const risk = [];
-    for (const [key, totalDispensed] of usageMap.entries()) {
-      const activeDispensingDays = activeDaysMap.get(key)?.size || 0;
-      const avgDaily =
-        activeDispensingDays > 0 ? totalDispensed / activeDispensingDays : 0;
-
-      if (!avgDaily || avgDaily <= 0) continue;
-
-      const onHand = stockMap.get(key) || 0;
-      const daysOfStock = onHand / avgDaily;
-
-      if (Number.isFinite(daysOfStock) && daysOfStock <= stockoutThresholdDays) {
-        const [facilityId, productId] = key.split("__");
-        risk.push({
-          facilityId,
-          productId,
-          onHand,
-          avgDaily,
-          daysOfStock,
-          activeDispensingDays,
-        });
-      }
-    }
-
-    risk.sort((a, b) => a.daysOfStock - b.daysOfStock);
-    const topRisk = risk.slice(0, 50);
-
-    const riskFacilityIds = [...new Set(topRisk.map((r) => r.facilityId))];
-    const riskProductIds = [...new Set(topRisk.map((r) => r.productId))];
-
-    const [riskFacilities, riskProducts] = await Promise.all([
-      prisma.facility.findMany({
-        where: { id: { in: riskFacilityIds } },
-        select: { id: true, code: true, name: true },
+    const [dispensedAgg, positions] = await Promise.all([
+      prisma.dispense.aggregate({
+        where: {
+          boxId: { not: null },
+          visit: {
+            visitDate: { gte: windowStart },
+            ...(facilityFilter !== undefined ? { facilityId: facilityFilter } : {}),
+          },
+        },
+        _sum: { quantitySachets: true },
       }),
-      prisma.product.findMany({
-        where: { id: { in: riskProductIds } },
-        select: { id: true, code: true, name: true },
-      }),
+      computeStockPositions({ facilityFilter, days, today }),
     ]);
+    const sachetsDispensed = dispensedAgg._sum.quantitySachets || 0;
 
-    const rfMap = new Map(riskFacilities.map((f) => [f.id, f]));
-    const rpMap = new Map(riskProducts.map((p) => [p.id, p]));
-
-    const stockoutRisk = topRisk.map((r) => ({
-      facility: rfMap.get(r.facilityId) || { id: r.facilityId },
-      product: rpMap.get(r.productId) || { id: r.productId },
-      onHandSachets: r.onHand,
-      activeDispensingDays: r.activeDispensingDays,
-      avgDailyDispense: Number(r.avgDaily.toFixed(2)),
-      daysOfStock: Number(r.daysOfStock.toFixed(1)),
-    }));
+    const topRisk = riskRowsFrom(positions, stockoutThresholdDays).slice(0, 50);
+    const { facilityMap: rfMap, productMap: rpMap } = await lookupFacilitiesAndProducts(topRisk);
+    const stockoutRisk = topRisk.map((r) => stockRiskPayload(r, rfMap.get(r.facilityId), rpMap.get(r.productId)));
+    const unit = await stockUnitFor(req);
 
     return res.json({
+      unit,
       kpis: {
         boxesInWarehouse,
         boxesInTransit,
@@ -449,7 +527,7 @@ router.get("/alerts", requireAuth, async (req, res) => {
         ? {
             status: "DISPATCHED",
             dispatchedAt: { lt: slaDate },
-            fromWarehouseId: scope.warehouseId,
+            OR: [{ fromWarehouseId: { in: scope.warehouseIds } }, { toFacilityId: { in: scope.warehouseIds } }],
           }
         : scope.mode === "FACILITY"
         ? {
@@ -466,7 +544,8 @@ router.get("/alerts", requireAuth, async (req, res) => {
       include: {
         toFacility: { select: { id: true, code: true, name: true } },
         fromWarehouse: { select: { id: true, code: true, name: true } },
-        _count: { select: { items: true } },
+        // Boxes still outstanding, not boxes already received from this shipment.
+        _count: { select: { items: { where: { receivedAt: null } } } },
       },
     });
 
@@ -522,123 +601,25 @@ router.get("/alerts", requireAuth, async (req, res) => {
     });
 
     // ---- Stockout risk (same logic as overview, but returns as alerts) ----
-    const windowStart = new Date(today);
-    windowStart.setDate(windowStart.getDate() - days);
-
-    const dispenses = await prisma.dispense.findMany({
-      where: {
-        boxId: { not: null },
-        visit:
-          scope.mode === "ALL"
-            ? { visitDate: { gte: windowStart } }
-            : {
-                facilityId: { in: scope.facilityIdsFacilitiesOnly },
-                visitDate: { gte: windowStart },
-              },
-      },
-      select: {
-        quantitySachets: true,
-        visit: { select: { facilityId: true, visitDate: true } },
-        box: { select: { productId: true } },
-      },
-      take: 50000,
+    const positions = await computeStockPositions({
+      facilityFilter: scope.mode === "ALL" ? undefined : { in: scope.facilityIdsFacilitiesOnly },
+      days,
+      today,
     });
-
-    const usageMap = new Map();
-    const activeDaysMap = new Map();
-
-    for (const d of dispenses) {
-      const facilityId = d.visit?.facilityId;
-      const productId = d.box?.productId;
-      const visitDate = d.visit?.visitDate;
-      if (!facilityId || !productId || !visitDate) continue;
-
-      const key = `${facilityId}__${productId}`;
-      usageMap.set(
-        key,
-        (usageMap.get(key) || 0) + (Number(d.quantitySachets) || 0)
-      );
-
-      if (!activeDaysMap.has(key)) activeDaysMap.set(key, new Set());
-      activeDaysMap.get(key).add(getActiveDayKey(visitDate));
-    }
-
-    const stockRows = await prisma.box.findMany({
-      where: {
-        status: "IN_FACILITY",
-        currentFacilityId:
-          scope.mode === "ALL"
-            ? undefined
-            : { in: scope.facilityIdsFacilitiesOnly },
-      },
-      select: { sachetsRemaining: true, currentFacilityId: true, productId: true },
-      take: 50000,
-    });
-
-    const stockMap = new Map();
-    for (const r of stockRows) {
-      const key = `${r.currentFacilityId}__${r.productId}`;
-      stockMap.set(key, (stockMap.get(key) || 0) + (r.sachetsRemaining || 0));
-    }
-
-    const risk = [];
-    for (const [key, totalDispensed] of usageMap.entries()) {
-      const activeDispensingDays = activeDaysMap.get(key)?.size || 0;
-      const avgDaily =
-        activeDispensingDays > 0 ? totalDispensed / activeDispensingDays : 0;
-
-      if (!avgDaily || avgDaily <= 0) continue;
-
-      const onHand = stockMap.get(key) || 0;
-      const daysOfStock = onHand / avgDaily;
-      if (Number.isFinite(daysOfStock) && daysOfStock <= stockoutThresholdDays) {
-        const [facilityId, productId] = key.split("__");
-        risk.push({
-          facilityId,
-          productId,
-          onHand,
-          avgDaily,
-          daysOfStock,
-          activeDispensingDays,
-        });
-      }
-    }
-
-    risk.sort((a, b) => a.daysOfStock - b.daysOfStock);
-    const topRisk = risk.slice(0, 30);
-
-    const facilityIds = [...new Set(topRisk.map((r) => r.facilityId))];
-    const productIds = [...new Set(topRisk.map((r) => r.productId))];
-
-    const [facilities, products] = await Promise.all([
-      prisma.facility.findMany({
-        where: { id: { in: facilityIds } },
-        select: { id: true, code: true, name: true },
-      }),
-      prisma.product.findMany({
-        where: { id: { in: productIds } },
-        select: { id: true, code: true, name: true },
-      }),
-    ]);
-
-    const fMap = new Map(facilities.map((f) => [f.id, f]));
-    const pMap = new Map(products.map((p) => [p.id, p]));
+    const topRisk = riskRowsFrom(positions, stockoutThresholdDays).slice(0, 30);
+    const { facilityMap: fMap, productMap: pMap } = await lookupFacilitiesAndProducts(topRisk);
 
     topRisk.forEach((r) => {
       alerts.push({
         type: "STOCKOUT_RISK",
         severity: r.daysOfStock <= 7 ? "HIGH" : "MEDIUM",
-        facility: fMap.get(r.facilityId) || { id: r.facilityId },
-        product: pMap.get(r.productId) || { id: r.productId },
-        onHandSachets: r.onHand,
-        activeDispensingDays: r.activeDispensingDays,
-        avgDailyDispense: Number(r.avgDaily.toFixed(2)),
-        daysOfStock: Number(r.daysOfStock.toFixed(1)),
+        ...stockRiskPayload(r, fMap.get(r.facilityId), pMap.get(r.productId)),
       });
     });
 
     return res.json({
       alerts,
+      unit: await stockUnitFor(req),
       meta: { scope: scope.mode, days, stockoutThresholdDays, expiryWarnDays, transitSlaDays },
     });
   } catch (err) {
@@ -685,9 +666,6 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
     const warnDate = new Date(today);
     warnDate.setDate(warnDate.getDate() + expiryWarnDays);
 
-    const windowStart = new Date(today);
-    windowStart.setDate(windowStart.getDate() - days);
-
     // 1) Stock on hand grouped by product
     const stockAgg = await prisma.box.groupBy({
       by: ["productId"],
@@ -696,43 +674,18 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
       _sum: { sachetsRemaining: true },
     });
 
-    const productIds = stockAgg.map((r) => r.productId);
+    // 2) Consumption-based position per product (includes products that ran
+    //    out recently, which have no boxes on hand).
+    const positions = await computeStockPositions({ facilityFilter: facilityId, days, today });
+    const positionByProduct = new Map(positions.map((p) => [p.productId, p]));
+
+    const productIds = [...new Set([...stockAgg.map((r) => r.productId), ...positions.map((p) => p.productId)])];
     const products = await prisma.product.findMany({
       where: { id: { in: productIds } },
       select: { id: true, code: true, name: true },
     });
     const productMap = new Map(products.map((p) => [p.id, p]));
-
-    // 2) Consumption in last N days (dispenses) grouped by product
-    const dispenses = await prisma.dispense.findMany({
-      where: {
-        boxId: { not: null },
-        visit: { facilityId: facilityId, visitDate: { gte: windowStart } },
-      },
-      select: {
-        quantitySachets: true,
-        box: { select: { productId: true } },
-        visit: { select: { visitDate: true } },
-      },
-      take: 100000,
-    });
-
-    const usageMap = new Map();
-    const activeDaysMap = new Map();
-
-    for (const d of dispenses) {
-      const productId = d.box?.productId;
-      const visitDate = d.visit?.visitDate;
-      if (!productId || !visitDate) continue;
-
-      usageMap.set(
-        productId,
-        (usageMap.get(productId) || 0) + (Number(d.quantitySachets) || 0)
-      );
-
-      if (!activeDaysMap.has(productId)) activeDaysMap.set(productId, new Set());
-      activeDaysMap.get(productId).add(getActiveDayKey(visitDate));
-    }
+    const stockByProduct = new Map(stockAgg.map((r) => [r.productId, r]));
 
     // 3) Expiring soon in this facility
     const expiringSoon = await prisma.box.findMany({
@@ -754,19 +707,17 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
     });
 
     // Build byProduct rows
-    const byProduct = stockAgg
-      .map((r) => {
-        const p = productMap.get(r.productId) || { id: r.productId };
-        const onHandSachets = r._sum.sachetsRemaining || 0;
-        const boxesOnHand = r._count._all || 0;
+    const byProduct = productIds
+      .map((productId) => {
+        const p = productMap.get(productId) || { id: productId };
+        const stock = stockByProduct.get(productId);
+        const position = positionByProduct.get(productId);
+        const onHandSachets = stock?._sum.sachetsRemaining || 0;
+        const boxesOnHand = stock?._count._all || 0;
 
-        const totalDispensed = usageMap.get(r.productId) || 0;
-        const activeDispensingDays = activeDaysMap.get(r.productId)?.size || 0;
-        const avgDailyDispense =
-          activeDispensingDays > 0 ? totalDispensed / activeDispensingDays : 0;
-
-        let daysOfStock = null;
-        if (avgDailyDispense > 0) daysOfStock = onHandSachets / avgDailyDispense;
+        // No dispensing in the lookback: nothing to project from.
+        const avgDailyDispense = position ? position.avgDaily : 0;
+        const daysOfStock = position ? position.daysOfStock : null;
 
         const isAtRisk =
           daysOfStock !== null && Number.isFinite(daysOfStock) && daysOfStock <= stockoutThresholdDays;
@@ -775,7 +726,9 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
           product: p,
           boxesOnHand,
           onHandSachets,
-          activeDispensingDays,
+          activeDispensingDays: position?.activeDispensingDays || 0,
+          consumptionDays: position?.consumptionDays || 0,
+          stockedOut: onHandSachets === 0,
           avgDailyDispense: Number(avgDailyDispense.toFixed(2)),
           daysOfStock: daysOfStock === null ? null : Number(daysOfStock.toFixed(1)),
           isAtRisk,
@@ -795,6 +748,7 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
 
     return res.json({
       facility,
+      unit: await stockUnitFor(req),
       kpis: { boxesOnHand, sachetsRemaining },
       byProduct,
       stockoutRisk,
@@ -811,7 +765,7 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
 // GET /api/dashboard/children  (ANONYMIZED: no names)
 // Query: take, skip, q, facilityId
 // -----------------------------------------------------------------------------
-router.get("/children", requireAuth, async (req, res) => {
+router.get("/children", requireAuth, requireModule("CLINICAL"), async (req, res) => {
   try {
     const take = Math.min(200, Math.max(1, toInt(req.query.take, 50)));
     const skip = Math.max(0, toInt(req.query.skip, 0));
@@ -877,7 +831,7 @@ router.get("/children", requireAuth, async (req, res) => {
 // sachets dispensed per visit.
 // -----------------------------------------------------------------------------
 
-router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
+router.get("/children/:childId/measurements", requireAuth, requireModule("CLINICAL"), async (req, res) => {
   try {
     const childId = String(req.params.childId);
     const scope = await getScope(req);
@@ -1246,7 +1200,7 @@ router.get("/children/:childId/measurements", requireAuth, async (req, res) => {
 // row with anthropometry captured during the in-depth assessment and exposes
 // sachets dispensed per visit.
 // -----------------------------------------------------------------------------
-router.get("/reports/missed-appointments", requireAuth, async (req, res) => {
+router.get("/reports/missed-appointments", requireAuth, requireModule("CLINICAL"), async (req, res) => {
   try {
     const take = Math.min(200, Math.max(1, toInt(req.query.take, 10)));
     const skip = Math.max(0, toInt(req.query.skip, 0));
@@ -1458,11 +1412,107 @@ router.get("/reports/missed-appointments", requireAuth, async (req, res) => {
   }
 });
 // -----------------------------------------------------------------------------
+// GET /api/dashboard/reports/not-dispensed
+// Query: fromDate=YYYY-MM-DD, toDate=YYYY-MM-DD (visit date), facilityId, take, skip
+// Visits where nothing could be dispensed (e.g. enrollment during a stock-out).
+// Each row says whether the child has since been dispensed at a later visit.
+// -----------------------------------------------------------------------------
+router.get("/reports/not-dispensed", requireAuth, requireModule("CLINICAL"), async (req, res) => {
+  try {
+    const take = Math.min(200, Math.max(1, toInt(req.query.take, 10)));
+    const skip = Math.max(0, toInt(req.query.skip, 0));
+    const fromDateRaw = req.query.fromDate ? String(req.query.fromDate) : null;
+    const toDateRaw = req.query.toDate ? String(req.query.toDate) : null;
+    const requestedFacilityId = req.query.facilityId ? String(req.query.facilityId) : null;
+
+    const scope = await getScope(req);
+    if (requestedFacilityId && scope.mode !== "ALL" && !scope.facilityIdsFacilitiesOnly.includes(requestedFacilityId)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const fromDate = fromDateRaw ? startOfDay(fromDateRaw) : null;
+    const toDate = toDateRaw ? new Date(startOfDay(toDateRaw).getTime() + MS_PER_DAY - 1) : null;
+    if ((fromDate && isNaN(fromDate.getTime())) || (toDate && isNaN(toDate.getTime()))) {
+      return res.status(400).json({ message: "fromDate/toDate must be valid dates (YYYY-MM-DD)" });
+    }
+
+    const where = {
+      notDispensedReason: { not: null },
+      ...(fromDate || toDate
+        ? { visitDate: { ...(fromDate ? { gte: fromDate } : {}), ...(toDate ? { lte: toDate } : {}) } }
+        : {}),
+      facilityId: requestedFacilityId
+        ? requestedFacilityId
+        : scope.mode === "ALL"
+        ? undefined
+        : { in: scope.facilityIdsFacilitiesOnly },
+    };
+
+    const [total, visits] = await Promise.all([
+      prisma.childVisit.count({ where }),
+      prisma.childVisit.findMany({
+        where,
+        orderBy: [{ visitDate: "desc" }, { id: "asc" }],
+        take,
+        skip,
+        select: {
+          id: true,
+          childId: true,
+          visitDate: true,
+          sachetsPrescribed: true,
+          notDispensedReason: true,
+          child: { select: { uniqueChildNumber: true } },
+          facility: { select: { id: true, code: true, name: true } },
+        },
+      }),
+    ]);
+
+    // Earliest later visit with a dispense, per row.
+    const later = visits.length
+      ? await prisma.childVisit.findMany({
+          where: {
+            childId: { in: [...new Set(visits.map((v) => v.childId))] },
+            dispenses: { some: {} },
+          },
+          select: { childId: true, visitDate: true },
+          orderBy: { visitDate: "asc" },
+        })
+      : [];
+
+    const rows = visits.map((v) => {
+      const next = later.find((l) => l.childId === v.childId && l.visitDate > v.visitDate);
+      return {
+        visitId: v.id,
+        childId: v.childId,
+        uniqueChildNumber: v.child?.uniqueChildNumber || null,
+        facility: v.facility,
+        visitDate: v.visitDate,
+        sachetsPrescribed: v.sachetsPrescribed,
+        reason: v.notDispensedReason,
+        dispensedLaterOn: next ? next.visitDate : null,
+      };
+    });
+
+    return res.json({
+      summary: { notDispensed: total },
+      total,
+      take,
+      skip,
+      rows,
+      filters: { fromDate: fromDateRaw, toDate: toDateRaw, facilityId: requestedFacilityId },
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
+// -----------------------------------------------------------------------------
 // GET /api/dashboard/reports/honoured-follow-ups
 // Query: fromDate=YYYY-MM-DD, toDate=YYYY-MM-DD, take, skip
 // Counts honoured follow up visits and returns the honoured rows.
 // -----------------------------------------------------------------------------
-router.get("/reports/honoured-follow-ups", requireAuth, async (req, res) => {
+router.get("/reports/honoured-follow-ups", requireAuth, requireModule("CLINICAL"), async (req, res) => {
   try {
     const take = Math.min(200, Math.max(1, toInt(req.query.take, 10)));
     const skip = Math.max(0, toInt(req.query.skip, 0));
@@ -1673,11 +1723,17 @@ function canReviewDuplicateCases(req) {
   const role = String(req.user?.role || "").toUpperCase();
   return [
     "SUPER_ADMIN",
+    "COUNTRY_ADMIN",
     "VIEWER",
     "WAREHOUSE_OFFICER",
     "FACILITY_OFFICER",
     "CLINICIAN",
   ].includes(role);
+}
+
+// VIEWER can see duplicate cases but is read-only, so cannot resolve them.
+function canResolveDuplicateCases(req) {
+  return canReviewDuplicateCases(req) && String(req.user?.role || "").toUpperCase() !== "VIEWER";
 }
 
 function duplicateCaseScopeWhere(scope) {
@@ -1830,7 +1886,7 @@ async function enrichDuplicateCases(cases) {
   }));
 }
 
-router.get("/duplicate-cases", requireAuth, async (req, res) => {
+router.get("/duplicate-cases", requireAuth, requireModule("CLINICAL"), async (req, res) => {
   try {
     if (!canReviewDuplicateCases(req)) return res.status(403).json({ message: "Forbidden" });
 
@@ -1846,12 +1902,23 @@ router.get("/duplicate-cases", requireAuth, async (req, res) => {
     if (status) filters.push({ status });
 
     if (q) {
+      // People search by the child numbers they can see, not internal ids.
+      const matchingChildren = await prisma.child.findMany({
+        where: { OR: [{ uniqueChildNumber: { contains: q } }, { cwcNumber: { contains: q } }] },
+        select: { id: true },
+        take: 500,
+      });
+      const childIds = matchingChildren.map((c) => c.id);
+
       filters.push({
         OR: [
           { primaryChildId: { contains: q } },
           { duplicateChildId: { contains: q } },
           { mobileDecision: { contains: q } },
           { source: { contains: q } },
+          ...(childIds.length
+            ? [{ primaryChildId: { in: childIds } }, { duplicateChildId: { in: childIds } }]
+            : []),
         ],
       });
     }
@@ -1876,7 +1943,7 @@ router.get("/duplicate-cases", requireAuth, async (req, res) => {
   }
 });
 
-router.get("/duplicate-cases/:id", requireAuth, async (req, res) => {
+router.get("/duplicate-cases/:id", requireAuth, requireModule("CLINICAL"), async (req, res) => {
   try {
     if (!canReviewDuplicateCases(req)) return res.status(403).json({ message: "Forbidden" });
 
@@ -1893,9 +1960,9 @@ router.get("/duplicate-cases/:id", requireAuth, async (req, res) => {
   }
 });
 
-router.patch("/duplicate-cases/:id/resolve", requireAuth, async (req, res) => {
+router.patch("/duplicate-cases/:id/resolve", requireAuth, requireModule("CLINICAL"), async (req, res) => {
   try {
-    if (!canReviewDuplicateCases(req)) return res.status(403).json({ message: "Forbidden" });
+    if (!canResolveDuplicateCases(req)) return res.status(403).json({ message: "Forbidden" });
 
     const action = req.body?.action || req.body?.resolutionAction;
     const nextStatus = mapDuplicateResolutionActionToStatus(action);

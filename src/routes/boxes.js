@@ -3,6 +3,7 @@ const router = express.Router();
 
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
+const { countryWideImplementationId, locationWithDescendants } = require("../auth/access");
 const { requireRole } = require("../middleware/rbac");
 const crypto = require("crypto");
 
@@ -65,7 +66,19 @@ router.get("/", requireAuth, async (req, res) => {
     if (!facility) return res.status(404).json({ message: "Facility not found" });
 
     // scope rules (keep it simple + safe for MVP)
-    if (req.user.role !== "SUPER_ADMIN") {
+    const countryId = countryWideImplementationId(req.user);
+    if (countryId) {
+      // COUNTRY_ADMIN / country-wide VIEWER: any location in their country.
+      if (facility.implementationId !== countryId) {
+        return res.status(403).json({ message: "Forbidden: not in your country" });
+      }
+    } else if (req.user.role === "VIEWER" && req.user.facilityType === "WAREHOUSE") {
+      // A viewer on a warehouse reads everything below it.
+      const ids = await locationWithDescendants(req.user.facilityId);
+      if (!ids.includes(facility.id)) {
+        return res.status(403).json({ message: "Forbidden: not in your warehouse scope" });
+      }
+    } else if (req.user.role !== "SUPER_ADMIN") {
       const myFacilityId = req.user.facilityId ? String(req.user.facilityId) : null;
 
       // If user is a warehouse officer OR assigned to a warehouse: allow warehouse + its child facilities
@@ -74,7 +87,9 @@ router.get("/", requireAuth, async (req, res) => {
 
         const ok =
           (myWarehouseId && facility.id === myWarehouseId) ||
-          (myWarehouseId && facility.warehouseId === myWarehouseId);
+          (myWarehouseId && facility.warehouseId === myWarehouseId) ||
+          // Locations directly below this warehouse, e.g. its field bases.
+          (myWarehouseId && facility.parentStockLocationId === myWarehouseId);
 
         if (!ok) {
           return res.status(403).json({ message: "Forbidden: not in your warehouse scope" });
@@ -300,6 +315,17 @@ router.get("/:boxUid", requireAuth, async (req, res) => {
 
     if (!box) return res.status(404).json({ message: "Box not found" });
 
+    // Scope to the user's implementation (country/programme). Staff still need
+    // to look up boxes arriving from elsewhere in their programme, so this is
+    // not limited to their own facility. Out-of-scope boxes look like 404s.
+    if (req.user.role !== "SUPER_ADMIN") {
+      const boxImplementationId = box.product?.implementationId || box.currentFacility?.implementationId || null;
+      const userImplementationId = req.user.implementationId || null;
+      if (boxImplementationId !== userImplementationId) {
+        return res.status(404).json({ message: "Box not found" });
+      }
+    }
+
     return res.json(box);
   } catch (err) {
     console.error(err);
@@ -368,12 +394,43 @@ router.post(
       if (fromFacility.type !== "WAREHOUSE") {
         return res.status(400).json({ message: "Dispatch must be FROM a WAREHOUSE facility" });
       }
-      if (toFacility.type !== "FACILITY") {
+      // Destination: a facility/site, or (warehouse-to-warehouse transfer) a
+      // warehouse directly below this one, e.g. Juba main warehouse -> field base.
+      const isWarehouseTransfer = toFacility.type === "WAREHOUSE";
+      if (isWarehouseTransfer) {
+        if (toFacility.id === fromFacility.id) {
+          return res.status(400).json({ message: "A warehouse cannot dispatch to itself" });
+        }
+        if (String(toFacility.parentStockLocationId || "") !== String(fromFacility.id)) {
+          return res.status(400).json({
+            message: "Stock can only be transferred to a warehouse directly below this one (e.g. main warehouse to field base)",
+          });
+        }
+      } else if (toFacility.type !== "FACILITY") {
         return res.status(400).json({ message: "Dispatch destination must be a FACILITY" });
       }
 
-      // Enforce scope: destination must belong to this warehouse
-      if (toFacility.warehouseId && String(toFacility.warehouseId) !== String(fromFacility.id)) {
+      // Enforce scope: never across implementations (countries/programmes).
+      if (
+        fromFacility.implementationId &&
+        toFacility.implementationId &&
+        String(fromFacility.implementationId) !== String(toFacility.implementationId)
+      ) {
+        return res.status(400).json({
+          message: "Destination facility belongs to a different implementation than this warehouse",
+        });
+      }
+
+      // Enforce scope: destination must be linked to this warehouse, either via
+      // the legacy warehouseId or the generic stock-location parent. An unlinked
+      // destination is no longer accepted by default; only SUPER_ADMIN may send to
+      // one (same implementation), e.g. while a new facility is being set up.
+      const linkedToSource =
+        String(toFacility.warehouseId || "") === String(fromFacility.id) ||
+        String(toFacility.parentStockLocationId || "") === String(fromFacility.id);
+      const linkedElsewhere = !linkedToSource && (toFacility.warehouseId || toFacility.parentStockLocationId);
+
+      if (linkedElsewhere || (!linkedToSource && req.user.role !== "SUPER_ADMIN")) {
         return res.status(400).json({
           message: "Destination facility is not linked to this warehouse",
           hint: "Link the facility to this warehouse (warehouseId) before dispatch",
@@ -383,7 +440,7 @@ router.post(
       // Fetch boxes
       const boxes = await prisma.box.findMany({
         where: { boxUid: { in: boxUids } },
-        select: { id: true, boxUid: true, status: true, currentFacilityId: true },
+        select: { id: true, boxUid: true, status: true, currentFacilityId: true, heldAt: true, holdReason: true },
       });
 
       if (boxes.length !== boxUids.length) {
@@ -402,6 +459,19 @@ router.post(
           message: "Some boxes are not eligible for dispatch (must be IN_WAREHOUSE and in the fromFacility)",
           invalid: invalid.slice(0, 25),
           hint: "Check status/currentFacilityId of the invalid boxes",
+        });
+      }
+
+      // Boxes on hold (quarantine / pending write-off) must not leave.
+      const held = boxes.filter((b) => b.heldAt);
+      if (held.length) {
+        return res.status(400).json({
+          code: "BOXES_ON_HOLD",
+          message: `${held.length} box${held.length === 1 ? " is" : "es are"} on hold and cannot be dispatched: ${held
+            .slice(0, 5)
+            .map((b) => `${b.boxUid} (${b.holdReason || "on hold"})`)
+            .join(", ")}${held.length > 5 ? "…" : ""}`,
+          held: held.slice(0, 25).map((b) => ({ boxUid: b.boxUid, holdReason: b.holdReason })),
         });
       }
 
@@ -429,6 +499,7 @@ router.post(
 
       // Transaction: create shipment(manifest) + update boxes + create events
       let shipment = null;
+      try {
       await prisma.$transaction(async (tx) => {
         shipment = await tx.shipment.create({
           data: {
@@ -447,13 +518,21 @@ router.post(
           skipDuplicates: true,
         });
 
-        await tx.box.updateMany({
-          where: { id: { in: boxIds } },
+        // Conditional: the eligibility check above ran outside this transaction,
+        // so re-check at write time. If another dispatch took any of these boxes
+        // first, roll back rather than put the same box on two manifests.
+        const moved = await tx.box.updateMany({
+          where: { id: { in: boxIds }, status: "IN_WAREHOUSE", currentFacilityId: fromFacilityId },
           data: {
             status: "IN_TRANSIT",
             currentFacilityId: null, // remove from warehouse stock immediately
           },
         });
+        if (moved.count !== boxIds.length) {
+          const e = new Error("Some boxes were dispatched by another request in the meantime. Refresh and try again.");
+          e.status = 409;
+          throw e;
+        }
 
         await tx.boxEvent.createMany({
           data: boxIds.map((id) => ({
@@ -466,6 +545,26 @@ router.post(
           })),
         });
       });
+      } catch (err) {
+        // Same idempotency key sent twice at once: the other request created the
+        // shipment, so answer as a replay instead of a 500.
+        if (idemKey && err?.code === "P2002" && String(err?.meta?.target ?? "").includes("idempotencyKey")) {
+          const existing = await prisma.shipment.findUnique({ where: { idempotencyKey: idemKey } });
+          if (existing) {
+            return res.json({
+              message: "Dispatched (idempotent replay)",
+              shipmentId: existing.id,
+              manifestNo: existing.manifestNo,
+              waybillUrl: `/api/shipments/${existing.id}/waybill.pdf`,
+              fromFacility: { id: fromFacility.id, code: fromFacility.code, name: fromFacility.name },
+              toFacility: { id: toFacility.id, code: toFacility.code, name: toFacility.name },
+              dispatchedCount: boxUids.length,
+              sample: boxUids.slice(0, 10),
+            });
+          }
+        }
+        throw err;
+      }
 
       return res.json({
         message: "Dispatched",
@@ -503,24 +602,24 @@ router.post(
 // - after receive: status IN_FACILITY, currentFacilityId = toFacilityId
 // - logs BoxEvent: FACILITY_RECEIVE
 // ============================================================================
-router.post(
-  "/facility-receive",
-  requireAuth,
-  requireRole("SUPER_ADMIN", "FACILITY_OFFICER", "CLINICIAN"),
-  async (req, res) => {
+// Also mounted as POST /api/boxes/receive. Besides facilities receiving from
+// their warehouse, a field base WAREHOUSE_OFFICER receives warehouse-to-warehouse
+// transfers here (against the manifest); those boxes become IN_WAREHOUSE.
+async function receiveShipmentHandler(req, res) {
     try {
       const boxUids = uniqueStrings(req.body.boxUids);
       const note = req.body.note ? String(req.body.note) : null;
 
-      // Receiving facility is always the logged-in facility for facility users.
-      // SUPER_ADMIN can specify toFacilityId, otherwise default to their assigned facility.
+      // Receiving location is always the logged-in user's own facility or
+      // warehouse. SUPER_ADMIN can specify toFacilityId.
       let toFacilityId = req.body.toFacilityId
         ? String(req.body.toFacilityId)
         : req.user.facilityId
         ? String(req.user.facilityId)
         : null;
 
-      if (req.user.role === "FACILITY_OFFICER" || req.user.role === "CLINICIAN") {
+      const receivesOwnLocationOnly = ["FACILITY_OFFICER", "CLINICIAN", "WAREHOUSE_OFFICER"].includes(req.user.role);
+      if (receivesOwnLocationOnly) {
         toFacilityId = req.user.facilityId ? String(req.user.facilityId) : toFacilityId;
       }
 
@@ -534,27 +633,92 @@ router.post(
       if (!toFacilityId)
         return res.status(400).json({ message: "toFacilityId is required (or assign user a facility)" });
 
-      // Facility scoping: facility users must receive into their own facility
-      if ((req.user.role === "FACILITY_OFFICER" || req.user.role === "CLINICIAN") && String(req.user.facilityId) !== String(toFacilityId)) {
-        return res.status(403).json({ message: "Forbidden: you can only receive into your own facility" });
+      // Scoping: staff can only receive into their own facility/warehouse.
+      if (receivesOwnLocationOnly && String(req.user.facilityId) !== String(toFacilityId)) {
+        return res.status(403).json({ message: "Forbidden: you can only receive into your own location" });
       }
 
       const toFacility = await assertFacilityExists(toFacilityId);
 
+      // Warehouse-to-warehouse transfers are always received against their
+      // manifest (no legacy manifest-less path for warehouses).
+      const intoWarehouse = toFacility.type === "WAREHOUSE";
+      if (intoWarehouse && !shipmentId) {
+        return res.status(400).json({ message: "Receiving into a warehouse requires the shipment (manifest)" });
+      }
+      if (req.user.role === "WAREHOUSE_OFFICER" && !intoWarehouse) {
+        return res.status(403).json({ message: "Forbidden: warehouse officers receive into their warehouse" });
+      }
+
       // Fetch boxes
-      const boxes = await prisma.box.findMany({
+      const allBoxes = await prisma.box.findMany({
         where: { boxUid: { in: boxUids } },
-        select: { id: true, boxUid: true, status: true },
+        select: { id: true, boxUid: true, status: true, currentFacilityId: true },
       });
 
-      if (boxes.length !== boxUids.length) {
-        const found = new Set(boxes.map((b) => b.boxUid));
+      if (allBoxes.length !== boxUids.length) {
+        const found = new Set(allBoxes.map((b) => b.boxUid));
         const missing = boxUids.filter((u) => !found.has(u));
         return res.status(400).json({ message: "Some boxUids were not found", missing });
       }
 
+      let shipment = null;
+      let boxes = allBoxes;
+      if (shipmentId) {
+        shipment = await prisma.shipment.findUnique({
+          where: { id: shipmentId },
+          include: { items: { select: { boxId: true, receivedAt: true } } },
+        });
+
+        if (!shipment) return res.status(404).json({ message: "Shipment not found" });
+        if (String(shipment.toFacilityId) !== String(toFacilityId)) {
+          return res.status(400).json({
+            message: "This shipment is not destined for your facility",
+            shipmentToFacilityId: shipment.toFacilityId,
+            yourFacilityId: toFacilityId,
+          });
+        }
+
+        const itemByBoxId = new Map(shipment.items.map((i) => [i.boxId, i]));
+        const unexpected = allBoxes.filter((b) => !itemByBoxId.has(b.id)).map((b) => b.boxUid);
+        if (unexpected.length) {
+          return res.status(400).json({
+            message: "Some scanned boxes are not part of this shipment manifest",
+            unexpected: unexpected.slice(0, 25),
+          });
+        }
+
+        // Boxes this manifest already delivered here come from a retried or
+        // duplicated sync of the same receive. Skip them instead of rejecting
+        // the whole request (which would park it in NEEDS_REVIEW on the phone).
+        boxes = allBoxes.filter((b) => {
+          const item = itemByBoxId.get(b.id);
+          return !(item?.receivedAt && String(b.currentFacilityId) === String(toFacilityId));
+        });
+
+        if (boxes.length === 0) {
+          const remaining = shipment.items.filter((i) => !i.receivedAt).length;
+          return res.json({
+            message: "Facility received (manifest, already recorded)",
+            replayed: true,
+            shipmentId,
+            toFacility: { id: toFacility.id, code: toFacility.code, name: toFacility.name },
+            receivedCount: 0,
+            alreadyReceivedCount: allBoxes.length,
+            remainingExpected: remaining,
+            sample: boxUids.slice(0, 10),
+          });
+        }
+
+        if (shipment.status !== "DISPATCHED") {
+          return res.status(400).json({ message: "Shipment is not open for receiving", status: shipment.status });
+        }
+      }
+
       // Must be IN_TRANSIT
-      const invalid = boxes.filter((b) => b.status !== "IN_TRANSIT");
+      const invalid = boxes
+        .filter((b) => b.status !== "IN_TRANSIT")
+        .map((b) => ({ id: b.id, boxUid: b.boxUid, status: b.status }));
       if (invalid.length) {
         return res.status(400).json({
           message: "Some boxes are not eligible for facility receive (must be IN_TRANSIT)",
@@ -565,49 +729,35 @@ router.post(
       const boxIds = boxes.map((b) => b.id);
 
       // If shipmentId is provided, enforce receipt strictly against the manifest.
-      if (shipmentId) {
-        const shipment = await prisma.shipment.findUnique({
-          where: { id: shipmentId },
-          include: { items: { select: { boxId: true, receivedAt: true } } },
-        });
-
-        if (!shipment) return res.status(404).json({ message: "Shipment not found" });
-        if (shipment.status !== "DISPATCHED") {
-          return res.status(400).json({ message: "Shipment is not open for receiving", status: shipment.status });
-        }
-        if (String(shipment.toFacilityId) !== String(toFacilityId)) {
-          return res.status(400).json({
-            message: "This shipment is not destined for your facility",
-            shipmentToFacilityId: shipment.toFacilityId,
-            yourFacilityId: toFacilityId,
-          });
-        }
-
-        const expected = new Set(shipment.items.map((i) => i.boxId));
-        const unexpected = boxes.filter((b) => !expected.has(b.id)).map((b) => b.boxUid);
-        if (unexpected.length) {
-          return res.status(400).json({
-            message: "Some scanned boxes are not part of this shipment manifest",
-            unexpected: unexpected.slice(0, 25),
-          });
-        }
+      if (shipment) {
 
         await prisma.$transaction(async (tx) => {
-          await tx.box.updateMany({
-            where: { id: { in: boxIds } },
+          // Conditional on IN_TRANSIT so a concurrent copy of this request cannot
+          // also log receive events; the loser rolls back and its retry is a replay.
+          const moved = await tx.box.updateMany({
+            where: { id: { in: boxIds }, status: "IN_TRANSIT" },
             data: {
-              status: "IN_FACILITY",
+              // A field base receiving a transfer holds the stock as warehouse stock.
+              status: intoWarehouse ? "IN_WAREHOUSE" : "IN_FACILITY",
               currentFacilityId: toFacilityId,
             },
           });
+          if (moved.count !== boxIds.length) {
+            const e = new Error("These boxes are being received by another request; retry shortly");
+            e.status = 503;
+            throw e;
+          }
 
           await tx.boxEvent.createMany({
             data: boxIds.map((id) => ({
               boxId: id,
-              type: "FACILITY_RECEIVE",
+              type: intoWarehouse ? "WAREHOUSE_RECEIVE" : "FACILITY_RECEIVE",
               performedByUserId: req.user.id,
+              fromFacilityId: shipment.fromWarehouseId,
               toFacilityId: toFacilityId,
-              note: note || `Received against manifest ${shipment.manifestNo} into facility ${toFacility.code}`,
+              note:
+                note ||
+                `Received against manifest ${shipment.manifestNo} into ${intoWarehouse ? "warehouse" : "facility"} ${toFacility.code}`,
             })),
           });
 
@@ -630,10 +780,11 @@ router.post(
         const remaining = await prisma.shipmentItem.count({ where: { shipmentId, receivedAt: null } });
 
         return res.json({
-          message: "Facility received (manifest)",
+          message: intoWarehouse ? "Warehouse received (manifest)" : "Facility received (manifest)",
           shipmentId,
           toFacility: { id: toFacility.id, code: toFacility.code, name: toFacility.name },
-          receivedCount: boxUids.length,
+          receivedCount: boxIds.length,
+          alreadyReceivedCount: allBoxes.length - boxIds.length,
           remainingExpected: remaining,
           sample: boxUids.slice(0, 10),
         });
@@ -669,13 +820,18 @@ router.post(
       }
 
       await prisma.$transaction(async (tx) => {
-        await tx.box.updateMany({
-          where: { id: { in: boxIds } },
+        const moved = await tx.box.updateMany({
+          where: { id: { in: boxIds }, status: "IN_TRANSIT" },
           data: {
             status: "IN_FACILITY",
             currentFacilityId: toFacilityId,
           },
         });
+        if (moved.count !== boxIds.length) {
+          const e = new Error("These boxes are being received by another request; retry shortly");
+          e.status = 503;
+          throw e;
+        }
 
         await tx.boxEvent.createMany({
           data: boxIds.map((id) => ({
@@ -686,6 +842,31 @@ router.post(
             note: note || `Received into facility ${toFacility.code}`,
           })),
         });
+
+        // Received without naming the manifest: still tick these boxes off the
+        // open shipment(s) they travelled on, and close any shipment that is now
+        // complete. Otherwise the shipment stays DISPATCHED forever and shows up
+        // as in transit / overdue.
+        const openItems = await tx.shipmentItem.findMany({
+          where: { boxId: { in: boxIds }, receivedAt: null, shipment: { status: "DISPATCHED", toFacilityId } },
+          select: { id: true, shipmentId: true },
+        });
+        if (openItems.length) {
+          const receivedAt = new Date();
+          await tx.shipmentItem.updateMany({
+            where: { id: { in: openItems.map((i) => i.id) } },
+            data: { receivedAt, receivedByUserId: req.user.id },
+          });
+          for (const shipmentId of new Set(openItems.map((i) => i.shipmentId))) {
+            const remaining = await tx.shipmentItem.count({ where: { shipmentId, receivedAt: null } });
+            if (remaining === 0) {
+              await tx.shipment.update({
+                where: { id: shipmentId },
+                data: { status: "RECEIVED", receivedAt, receivedByUserId: req.user.id },
+              });
+            }
+          }
+        }
       });
 
       return res.json({
@@ -699,8 +880,11 @@ router.post(
       const status = err.status || 500;
       return res.status(status).json({ message: err.message || "Server error" });
     }
-  }
-);
+}
+
+const RECEIVE_ROLES = ["SUPER_ADMIN", "FACILITY_OFFICER", "CLINICIAN", "WAREHOUSE_OFFICER"];
+router.post("/facility-receive", requireAuth, requireRole(...RECEIVE_ROLES), receiveShipmentHandler);
+router.post("/receive", requireAuth, requireRole(...RECEIVE_ROLES), receiveShipmentHandler);
 
 // ============================================================================
 // 4) STOCK SUMMARY (for dashboard)

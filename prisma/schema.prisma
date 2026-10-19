@@ -9,6 +9,9 @@ datasource db {
 
 enum UserRole {
   SUPER_ADMIN
+  // Administers one implementation (country/programme): its users and supply
+  // configuration, and sees all of its data. Cannot reach other countries.
+  COUNTRY_ADMIN
   WAREHOUSE_OFFICER
   FACILITY_OFFICER
   CLINICIAN
@@ -38,6 +41,37 @@ enum BoxEventType {
   ADJUSTMENT
 }
 
+enum PurchaseOrderStatus {
+  OPEN
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum StockAdjustmentStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum StockAdjustmentReason {
+  EXPIRED
+  DAMAGED
+  LOST
+  THEFT
+  CONTAMINATED
+  RECALLED
+  COUNT_VARIANCE
+  OTHER
+}
+
+enum StockCountStatus {
+  IN_PROGRESS
+  SUBMITTED
+  CANCELLED
+}
+
 enum ShipmentStatus {
   DISPATCHED
   RECEIVED
@@ -61,6 +95,33 @@ enum ModuleCode {
   CLINICAL
 }
 
+// Generic storage hierarchy used by the multi-country inventory platform.
+// Facility.type is retained for Kenya/mobile backward compatibility while
+// stockLocationType provides the richer hierarchy required by South Sudan.
+enum StockLocationType {
+  CENTRAL_WAREHOUSE
+  FIELD_BASE_WAREHOUSE
+  CLINIC_STORE
+  PHARMACY_STORE
+  OTHER
+}
+
+enum StockSourceType {
+  PURCHASE
+  IN_KIND_DONATION
+  TRANSFER
+  RETURN
+  OPENING_BALANCE
+  OTHER
+}
+
+enum ValuationBasis {
+  PURCHASE_COST
+  DONOR_DECLARED_VALUE
+  REPLACEMENT_COST
+  ESTIMATED_VALUE
+}
+
 model Country {
   id       String  @id @default(cuid())
   code     String  @unique
@@ -80,14 +141,33 @@ model Implementation {
   name      String
   isActive  Boolean @default(true)
 
-  country Country @relation(fields: [countryId], references: [id])
+  // Currency used for implementation-level inventory reporting. Individual
+  // batches retain their original valuation currency for auditability.
+  reportingCurrencyCode String @default("USD")
+
+  // Which warehouses may generate box QR labels: ALL_WAREHOUSES (main
+  // warehouses and field bases) or MAIN_ONLY (labels are made where goods are
+  // first received; field bases only receive labelled stock by transfer).
+  labelGenerationScope String @default("ALL_WAREHOUSES")
+
+  // Stock-control tools on the mobile app for warehouse officers: receive a
+  // delivery against a purchase order, stock counts and loss reports. Off by
+  // default so a country keeps its current app until it is ready (Kenya).
+  warehouseTools Boolean @default(false)
+
+  country Country                @relation(fields: [countryId], references: [id])
   modules ImplementationModule[]
 
   // Phase 1 links. These are nullable on the child models so the migration is
   // additive and safe for the existing Kenya production data.
-  facilities Facility[]
-  users      User[]
-  products   Product[]
+  facilities      Facility[]
+  users           User[]
+  products        Product[]
+  batchValuations ProductBatchValuation[]
+  counties        County[]
+  donors          Donor[]
+  purchaseOrders  PurchaseOrder[]
+  dhis2Config     Dhis2Config?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -122,6 +202,35 @@ model Facility {
   implementationId String?
   implementation   Implementation? @relation(fields: [implementationId], references: [id])
 
+  // Phase 2: treat each warehouse/facility as a generic stock location while
+  // keeping the legacy Facility model and routes intact for Kenya.
+  stockLocationType     StockLocationType @default(CLINIC_STORE)
+  parentStockLocationId String?
+  parentStockLocation   Facility?         @relation("StockLocationHierarchy", fields: [parentStockLocationId], references: [id])
+  childStockLocations   Facility[]        @relation("StockLocationHierarchy")
+
+  // Maximum physical storage capacity. Null means capacity has not yet been
+  // configured. We store MT directly because that is the requested planning
+  // unit; product weights are stored in kilograms and converted at reporting.
+  capacityMetricTonnes Decimal? @db.Decimal(12, 3)
+  // Physical building for the 3D view: BUILDING (default) or RUBB_HALL (tented
+  // warehouse, as at most field bases), with its inside length and width.
+  structureType        String?
+  // DHIS2 organisation unit UID of this site (DHIS2 integration).
+  dhis2OrgUnitId       String?
+  lengthM              Decimal? @db.Decimal(7, 2)
+  widthM               Decimal? @db.Decimal(7, 2)
+
+  // Administrative area (county) the location is in. Field bases and sites are
+  // grouped by county; a site is linked to one of its county's field bases.
+  // Optional, so existing (Kenya) locations are unaffected.
+  countyId String?
+  county   County? @relation(fields: [countyId], references: [id])
+
+  // GPS position in decimal degrees (optional).
+  latitude  Decimal? @db.Decimal(9, 6)
+  longitude Decimal? @db.Decimal(9, 6)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -135,6 +244,13 @@ model Facility {
 
   // Boxes currently at this facility
   boxes Box[] @relation("currentFacility")
+
+  purchaseOrdersInbound PurchaseOrder[]    @relation("PurchaseOrderDestination")
+  goodsReceipts         GoodsReceipt[]
+  stockAdjustments      StockAdjustment[]
+  stockCounts           StockCount[]
+  dhis2EventImports     Dhis2EventImport[]
+  stockConsumptions     StockConsumption[]
 
   // Facility-level history: events where this facility is the source
   outboundEvents BoxEvent[] @relation("fromFacility")
@@ -154,15 +270,40 @@ model Facility {
 
   @@index([warehouseId])
   @@index([implementationId])
+  @@index([parentStockLocationId])
+  @@index([stockLocationType])
+  @@index([countyId])
+  @@index([dhis2OrgUnitId])
+}
+
+// Configurable administrative areas per implementation (e.g. South Sudan:
+// Aweil East, Fangak, Duk...). Counties group field bases and sites; they are
+// not stock locations themselves.
+model County {
+  id               String  @id @default(cuid())
+  implementationId String
+  name             String
+  // Optional higher-level area the county belongs to (e.g. "Jonglei").
+  state            String?
+  isActive         Boolean @default(true)
+
+  implementation Implementation @relation(fields: [implementationId], references: [id])
+  locations      Facility[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([implementationId, name])
+  @@index([implementationId])
 }
 
 model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
+  id           String    @id @default(cuid())
+  email        String    @unique
   fullName     String
   passwordHash String
-  role         UserRole @default(VIEWER)
-  isActive     Boolean  @default(true)
+  role         UserRole  @default(VIEWER)
+  isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
 
   facilityId String?
@@ -185,6 +326,26 @@ model User {
   // Auth refresh tokens
   refreshTokens RefreshToken[]
 
+  // Sign-in protection: consecutive failed passwords and a temporary lock.
+  failedLoginCount   Int       @default(0)
+  lockedUntil        DateTime?
+  // Set when an admin creates the account or resets its password: the user
+  // must choose their own password before using the system.
+  mustChangePassword Boolean   @default(false)
+  passwordChangedAt  DateTime?
+
+  auditLogsPerformed AuditLog[] @relation("AuditActor")
+
+  purchaseOrdersCreated PurchaseOrder[]         @relation("PurchaseOrderCreatedBy")
+  goodsReceiptsReceived GoodsReceipt[]          @relation("GoodsReceiptReceivedBy")
+  documentsUploaded     PurchaseOrderDocument[]
+
+  adjustmentsRequested StockAdjustment[]         @relation("AdjustmentRequestedBy")
+  adjustmentsDecided   StockAdjustment[]         @relation("AdjustmentDecidedBy")
+  adjustmentDocuments  StockAdjustmentDocument[]
+  stockCountsStarted   StockCount[]              @relation("StockCountStartedBy")
+  stockCountsSubmitted StockCount[]              @relation("StockCountSubmittedBy")
+
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   shipmentItems ShipmentItem[]
@@ -194,13 +355,429 @@ model User {
   @@index([role])
 }
 
+// One row per issued refresh token (only its SHA-256 hash is stored).
+// rotatedAt: replaced by a newer token on refresh; still accepted for a short
+// grace period so two sync processes refreshing at once do not log out.
+// revokedAt: logout, deactivation or password reset; never accepted again.
+// Who did what to accounts and sign-in (user admin actions, lockouts,
+// password changes). Append-only.
+model AuditLog {
+  id               String   @id @default(cuid())
+  action           String
+  actorId          String?
+  actor            User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  actorEmail       String?
+  targetType       String?
+  targetId         String?
+  targetLabel      String?
+  implementationId String?
+  details          Json?
+  ipAddress        String?
+  createdAt        DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId])
+  @@index([targetType, targetId])
+  @@index([implementationId, createdAt])
+  @@index([action])
+}
+
+// Funding source for commodities (per implementation). Boxes carry their donor
+// so warehouse stock and value can be reported by donor.
+model Donor {
+  id               String  @id @default(cuid())
+  implementationId String
+  name             String
+  code             String?
+  isActive         Boolean @default(true)
+
+  implementation     Implementation      @relation(fields: [implementationId], references: [id])
+  boxes              Box[]
+  purchaseOrderLines PurchaseOrderLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([implementationId, name])
+  @@index([implementationId])
+}
+
+// A purchase order raised in the procurement system and entered by hand in
+// Anchor (the signed PDF is attached as evidence). Goods are received against
+// its lines; batch and expiry are captured at delivery.
+model PurchaseOrder {
+  id                     String              @id @default(cuid())
+  implementationId       String
+  poNumber               String
+  supplierName           String?
+  destinationWarehouseId String
+  orderDate              DateTime?
+  expectedDeliveryDate   DateTime?
+  currencyCode           String              @default("USD")
+  status                 PurchaseOrderStatus @default(OPEN)
+  note                   String?             @db.Text
+  createdById            String
+  cancelledAt            DateTime?
+  cancelReason           String?
+
+  implementation       Implementation          @relation(fields: [implementationId], references: [id])
+  destinationWarehouse Facility                @relation("PurchaseOrderDestination", fields: [destinationWarehouseId], references: [id])
+  createdBy            User                    @relation("PurchaseOrderCreatedBy", fields: [createdById], references: [id])
+  lines                PurchaseOrderLine[]
+  documents            PurchaseOrderDocument[]
+  receipts             GoodsReceipt[]
+  order                Order?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([implementationId, poNumber])
+  @@index([destinationWarehouseId])
+  @@index([status])
+  @@index([expectedDeliveryDate])
+}
+
+model PurchaseOrderLine {
+  id              String  @id @default(cuid())
+  purchaseOrderId String
+  lineNo          Int
+  productId       String
+  donorId         String
+  grantCode       String?
+  quantityPacks   Int
+  // Price per pack (carton/box) in the PO currency.
+  unitPrice       Decimal @db.Decimal(18, 6)
+  receivedPacks   Int     @default(0)
+
+  purchaseOrder PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product       Product            @relation(fields: [productId], references: [id])
+  donor         Donor              @relation(fields: [donorId], references: [id])
+  boxes         Box[]
+  receiptLines  GoodsReceiptLine[]
+
+  @@unique([purchaseOrderId, lineNo])
+  @@index([productId])
+  @@index([donorId])
+}
+
+// Evidence files (the PO PDF, delivery notes, photos). Stored in the database
+// so they are covered by the normal database backup.
+model PurchaseOrderDocument {
+  id              String   @id @default(cuid())
+  purchaseOrderId String
+  fileName        String
+  mimeType        String
+  sizeBytes       Int
+  data            Bytes    @db.LongBlob
+  uploadedById    String
+  createdAt       DateTime @default(now())
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  uploadedBy    User          @relation(fields: [uploadedById], references: [id])
+
+  @@index([purchaseOrderId])
+}
+
+// One delivery received against a PO (goods received note).
+model GoodsReceipt {
+  id              String   @id @default(cuid())
+  grnNumber       String   @unique
+  purchaseOrderId String
+  warehouseId     String
+  receivedById    String
+  receivedAt      DateTime @default(now())
+  deliveryNote    String?
+  waybillNo       String?
+  note            String?  @db.Text
+  clientRequestId String?  @unique
+
+  purchaseOrder PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id])
+  warehouse     Facility           @relation(fields: [warehouseId], references: [id])
+  receivedBy    User               @relation("GoodsReceiptReceivedBy", fields: [receivedById], references: [id])
+  lines         GoodsReceiptLine[]
+  boxes         Box[]
+
+  createdAt DateTime @default(now())
+
+  @@index([purchaseOrderId])
+  @@index([warehouseId, receivedAt])
+}
+
+model GoodsReceiptLine {
+  id                  String   @id @default(cuid())
+  goodsReceiptId      String
+  purchaseOrderLineId String
+  batchNo             String
+  expiryDate          DateTime
+  packs               Int
+
+  goodsReceipt      GoodsReceipt      @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
+  purchaseOrderLine PurchaseOrderLine @relation(fields: [purchaseOrderLineId], references: [id])
+
+  @@index([goodsReceiptId])
+  @@index([purchaseOrderLineId])
+}
+
+// A request to take stock out of the books (write-off): expired, damaged,
+// lost... The boxes are put on hold when requested and only leave stock when
+// an admin other than the requester approves. Value is captured per line at
+// request time so losses can be reported per donor.
+model StockAdjustment {
+  id               String                @id @default(cuid())
+  adjustmentNumber String                @unique
+  implementationId String
+  warehouseId      String
+  reason           StockAdjustmentReason
+  note             String?               @db.Text
+  status           StockAdjustmentStatus @default(PENDING_APPROVAL)
+  requestedById    String
+  requestedAt      DateTime              @default(now())
+  decidedById      String?
+  decidedAt        DateTime?
+  decisionNote     String?               @db.Text
+  stockCountId     String?               @unique
+  clientRequestId  String?               @unique
+
+  warehouse   Facility                  @relation(fields: [warehouseId], references: [id])
+  requestedBy User                      @relation("AdjustmentRequestedBy", fields: [requestedById], references: [id])
+  decidedBy   User?                     @relation("AdjustmentDecidedBy", fields: [decidedById], references: [id])
+  stockCount  StockCount?               @relation(fields: [stockCountId], references: [id])
+  lines       StockAdjustmentLine[]
+  documents   StockAdjustmentDocument[]
+  heldBoxes   Box[]                     @relation("AdjustmentHolds")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([warehouseId, status])
+  @@index([implementationId, status])
+  @@index([decidedAt])
+}
+
+model StockAdjustmentLine {
+  id              String   @id @default(cuid())
+  adjustmentId    String
+  boxId           String
+  // Snapshot at request time (reporting survives later box changes).
+  productId       String
+  batchNo         String
+  expiryDate      DateTime
+  donorId         String?
+  unitsBefore     Int
+  unitsWrittenOff Int
+  fullBox         Boolean
+  unitValue       Decimal? @db.Decimal(18, 6)
+  currencyCode    String?
+
+  adjustment StockAdjustment @relation(fields: [adjustmentId], references: [id], onDelete: Cascade)
+  box        Box             @relation(fields: [boxId], references: [id])
+
+  @@index([adjustmentId])
+  @@index([boxId])
+  @@index([productId])
+  @@index([donorId])
+}
+
+model StockAdjustmentDocument {
+  id           String   @id @default(cuid())
+  adjustmentId String
+  fileName     String
+  mimeType     String
+  sizeBytes    Int
+  data         Bytes    @db.LongBlob
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  adjustment StockAdjustment @relation(fields: [adjustmentId], references: [id], onDelete: Cascade)
+  uploadedBy User            @relation(fields: [uploadedById], references: [id])
+
+  @@index([adjustmentId])
+}
+
+// A physical stock count (stock take) of one warehouse, optionally one
+// product. Cartons are counted per batch; on submit, shortages become a
+// COUNT_VARIANCE write-off request and surpluses are flagged.
+model StockCount {
+  id               String           @id @default(cuid())
+  countNumber      String           @unique
+  implementationId String
+  warehouseId      String
+  productId        String?
+  status           StockCountStatus @default(IN_PROGRESS)
+  note             String?          @db.Text
+  startedById      String
+  startedAt        DateTime         @default(now())
+  submittedById    String?
+  submittedAt      DateTime?
+
+  warehouse   Facility         @relation(fields: [warehouseId], references: [id])
+  startedBy   User             @relation("StockCountStartedBy", fields: [startedById], references: [id])
+  submittedBy User?            @relation("StockCountSubmittedBy", fields: [submittedById], references: [id])
+  lines       StockCountLine[]
+  adjustment  StockAdjustment?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([warehouseId, status])
+}
+
+model StockCountLine {
+  id             String    @id @default(cuid())
+  stockCountId   String
+  // product|batch|expiry|donor: one line per pallet group.
+  groupKey       String
+  productId      String
+  batchNo        String
+  expiryDate     DateTime
+  donorId        String?
+  expectedBoxes  Int
+  countedBoxes   Int?
+  // Line added by the counter (stock found that the system does not show).
+  addedByCounter Boolean   @default(false)
+  note           String?
+  countedAt      DateTime?
+
+  stockCount StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+
+  @@unique([stockCountId, groupKey])
+  @@index([stockCountId])
+}
+
+// DHIS2 integration for one implementation (South Sudan): which tracker
+// program/stage/data element carries sachets dispensed per visit, which
+// product it consumes, and which aggregate data elements receive stock.
+// Credentials live in the server environment (DHIS2_URL, DHIS2_TOKEN or
+// DHIS2_USERNAME/DHIS2_PASSWORD), never in the database.
+model Dhis2Config {
+  id                      String    @id @default(cuid())
+  implementationId        String    @unique
+  enabled                 Boolean   @default(false)
+  programId               String?
+  programName             String?
+  programStageId          String?
+  dispenseDataElementId   String?
+  dispenseDataElementName String?
+  dispenseProductId       String?
+  // Event statuses that count as dispensed (comma separated).
+  countStatuses           String    @default("ACTIVE,COMPLETED")
+  // Ignore visits before this date (go-live).
+  startDate               DateTime?
+  stockPeriodType         String    @default("Daily")
+  intervalMinutes         Int       @default(60)
+  // High-water mark: last DHIS2 updatedAt fully processed.
+  pullCursor              DateTime?
+  lastPullAt              DateTime?
+  lastPushAt              DateTime?
+
+  implementation Implementation      @relation(fields: [implementationId], references: [id])
+  stockElements  Dhis2StockElement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// One product's stock data elements in DHIS2 (one per unit).
+model Dhis2StockElement {
+  id                   String  @id @default(cuid())
+  configId             String
+  productId            String
+  boxesDataElementId   String?
+  sachetsDataElementId String?
+
+  config  Dhis2Config @relation(fields: [configId], references: [id], onDelete: Cascade)
+  product Product     @relation(fields: [productId], references: [id])
+
+  @@unique([configId, productId])
+}
+
+// One DHIS2 visit event as last processed. Edits apply only the difference;
+// deleted events give their sachets back.
+model Dhis2EventImport {
+  id               String    @id @default(cuid())
+  eventUid         String    @unique
+  implementationId String
+  orgUnitId        String
+  facilityId       String?
+  occurredAt       DateTime?
+  dhis2UpdatedAt   DateTime?
+  status           String?
+  deleted          Boolean   @default(false)
+  // Sachets the event currently reports (last processed value).
+  reportedSachets  Int       @default(0)
+  // Sachets actually taken from stock for it.
+  deductedSachets  Int       @default(0)
+  // Reported but not in stock at the time.
+  shortfallSachets Int       @default(0)
+  note             String?
+
+  facility     Facility?          @relation(fields: [facilityId], references: [id])
+  consumptions StockConsumption[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([implementationId, facilityId])
+  @@index([orgUnitId])
+  @@index([shortfallSachets])
+}
+
+// Stock used at a facility outside LMIS clinical visits (e.g. dispensing
+// recorded in DHIS2). Negative sachets = returned after a correction.
+model StockConsumption {
+  id            String   @id @default(cuid())
+  facilityId    String
+  productId     String
+  sachets       Int
+  source        String   @default("DHIS2")
+  occurredAt    DateTime
+  eventImportId String?
+  createdAt     DateTime @default(now())
+
+  facility    Facility               @relation(fields: [facilityId], references: [id])
+  product     Product                @relation(fields: [productId], references: [id])
+  eventImport Dhis2EventImport?      @relation(fields: [eventImportId], references: [id], onDelete: SetNull)
+  lines       StockConsumptionLine[]
+
+  @@index([facilityId, occurredAt])
+  @@index([eventImportId])
+}
+
+model StockConsumptionLine {
+  id            String @id @default(cuid())
+  consumptionId String
+  boxId         String
+  sachets       Int
+
+  consumption StockConsumption @relation(fields: [consumptionId], references: [id], onDelete: Cascade)
+  box         Box              @relation(fields: [boxId], references: [id])
+
+  @@index([consumptionId])
+  @@index([boxId])
+}
+
+model Dhis2SyncRun {
+  id               String    @id @default(cuid())
+  implementationId String
+  direction        String
+  trigger          String    @default("SCHEDULE")
+  status           String    @default("RUNNING")
+  startedAt        DateTime  @default(now())
+  finishedAt       DateTime?
+  stats            Json?
+  error            String?   @db.Text
+
+  @@index([implementationId, startedAt])
+}
+
 model RefreshToken {
-  id        String   @id @default(cuid())
-  tokenHash String   @unique
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
   userId    String
   expiresAt DateTime
+  rotatedAt DateTime?
   revokedAt DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -214,6 +791,11 @@ model Order {
   donorName   String?
   createdAt   DateTime @default(now())
 
+  // Set when the boxes were received against a purchase order (box UIDs are
+  // numbered per order, so one Order per PO).
+  purchaseOrderId String?        @unique
+  purchaseOrder   PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
+
   boxes Box[]
 }
 
@@ -225,9 +807,58 @@ model Product {
   implementationId String?
   implementation   Implementation? @relation(fields: [implementationId], references: [id])
 
-  boxes Box[]
+  // Generic product/pack configuration. Defaults preserve the current Kenya
+  // SQLNS assumption (600 sachets per box), but new implementations can
+  // configure any base unit and pack size without changing code.
+  baseUnitName        String   @default("Sachet")
+  packUnitName        String   @default("Box")
+  unitsPerPack        Int      @default(600)
+  grossPackWeightKg   Decimal? @db.Decimal(12, 4)
+  // How many cartons the supplier stacks on one pallet (from the packing list).
+  // Drives pallet counts, the 3D warehouse view and space used.
+  cartonsPerPallet    Int?
+  defaultUnitValue    Decimal? @db.Decimal(18, 6)
+  defaultCurrencyCode String   @default("USD")
+  trackBatch          Boolean  @default(true)
+  trackExpiry         Boolean  @default(true)
+  isActive            Boolean  @default(true)
+
+  boxes              Box[]
+  batchValuations    ProductBatchValuation[]
+  purchaseOrderLines PurchaseOrderLine[]
+  dhis2StockElements Dhis2StockElement[]
+  stockConsumptions  StockConsumption[]
 
   @@index([implementationId])
+  @@index([isActive])
+}
+
+// Batch-level valuation is separate from Product because the same commodity
+// can enter the supply chain at different prices or as an in-kind donation.
+// unitValue is always the value of ONE base unit (e.g. one sachet/tablet/vial).
+model ProductBatchValuation {
+  id               String @id @default(cuid())
+  implementationId String
+  productId        String
+  batchNo          String
+
+  unitValue       Decimal         @db.Decimal(18, 6)
+  currencyCode    String          @default("USD")
+  valuationBasis  ValuationBasis  @default(PURCHASE_COST)
+  sourceType      StockSourceType @default(PURCHASE)
+  sourceReference String?
+  note            String?
+
+  implementation Implementation @relation(fields: [implementationId], references: [id])
+  product        Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([productId, batchNo])
+  @@index([implementationId])
+  @@index([productId])
+  @@index([batchNo])
 }
 
 model Box {
@@ -259,9 +890,39 @@ model Box {
   // Shipments / Manifests
   shipmentItems ShipmentItem[]
 
+  // Idempotency key of the box-generation request that created this box, so a
+  // retried request (e.g. after a client timeout) returns these boxes instead
+  // of generating a second set of labels.
+  generationRequestId String?
+
+  // Who paid for this box and, for stock received against a PO, which PO line
+  // (its unit price gives the box value) and which delivery.
+  donorId             String?
+  donor               Donor?             @relation(fields: [donorId], references: [id])
+  purchaseOrderLineId String?
+  purchaseOrderLine   PurchaseOrderLine? @relation(fields: [purchaseOrderLineId], references: [id])
+  goodsReceiptId      String?
+  goodsReceipt        GoodsReceipt?      @relation(fields: [goodsReceiptId], references: [id])
+
+  // On hold (quarantine): still in the warehouse but not dispatchable, e.g.
+  // expired, suspected damage, recall, or awaiting write-off approval.
+  heldAt           DateTime?
+  holdReason       String?
+  heldById         String?
+  holdAdjustmentId String?
+  holdAdjustment   StockAdjustment?       @relation("AdjustmentHolds", fields: [holdAdjustmentId], references: [id], onDelete: SetNull)
+  adjustmentLines  StockAdjustmentLine[]
+  consumptionLines StockConsumptionLine[]
+
+  @@index([donorId])
+  @@index([heldAt])
+  @@index([holdAdjustmentId])
+  @@index([purchaseOrderLineId])
+  @@index([goodsReceiptId])
   @@index([orderId])
   @@index([productId])
   @@index([currentFacilityId])
+  @@index([generationRequestId])
   @@index([batchNo])
   @@index([expiryDate])
 }
@@ -385,6 +1046,11 @@ model Child {
   // System-generated registration number (facilityCode/cwcNumber/program)
   uniqueChildNumber String @unique
 
+  // Offline queue id of the enrollment request that created this child. Lets a
+  // retried/duplicated sync request be recognised as a replay instead of being
+  // confused with a different child that shares the CWC number.
+  clientRequestId String? @unique
+
   // Optional CHP details from registration form
   chpName     String?
   chpContacts String?
@@ -430,6 +1096,10 @@ model InDepthAssessment {
   householdHungerScore    Int?
   householdHungerCategory String?
 
+  // Offline queue id of the request that created this assessment, so a replay
+  // (lost response) is recognised instead of failing as a duplicate.
+  clientRequestId String? @unique
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -463,6 +1133,17 @@ model ChildVisit {
   // NEW: Next appointment date stored ONLY in child visits
   nextAppointmentDate DateTime?
 
+  // Offline queue id of the request that created this visit, so replays of the
+  // same request never create a second visit or dispense stock twice.
+  clientRequestId String? @unique
+
+  // Sachets the clinician intended to give at this visit.
+  sachetsPrescribed  Int?
+  // Set when nothing could be dispensed (e.g. "STOCK_OUT": the facility did not
+  // have enough stock at enrollment). The child is still enrolled; these visits
+  // feed the "children not dispensed" report. Null means dispensed as normal.
+  notDispensedReason String?
+
   createdAt DateTime @default(now())
 
   child       Child    @relation(fields: [childId], references: [id])
@@ -476,6 +1157,7 @@ model ChildVisit {
   @@index([performedByUserId])
   @@index([visitDate])
   @@index([nextAppointmentDate])
+  @@index([notDispensedReason])
 }
 
 model Dispense {
@@ -495,6 +1177,7 @@ model Dispense {
   @@index([visitId])
   @@index([boxId])
 }
+
 model DuplicateCase {
   id String @id @default(cuid())
 
@@ -505,7 +1188,7 @@ model DuplicateCase {
   duplicateChildId String?
 
   // Facilities involved. These are plain ids for now to keep the review model simple and migration-safe.
-  facilityId String?
+  facilityId         String?
   matchingFacilityId String?
 
   // Example values: MOBILE_ENROLLMENT, SERVER_SYNC_VALIDATION, DASHBOARD_REVIEW
