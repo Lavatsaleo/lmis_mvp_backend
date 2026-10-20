@@ -28,6 +28,50 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 // window (it cannot dispense with nothing on hand).
 const STOCKOUT_LOOKBACK_DAYS = 90;
 
+// Dispensing is counted per calendar day where the facilities are (a visit
+// saved at local midnight must not fall on the previous day in UTC).
+const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || "Africa/Nairobi";
+const dayFormatter = new Intl.DateTimeFormat("en-CA", { timeZone: REPORT_TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" });
+const localDay = (d) => dayFormatter.format(d); // "YYYY-MM-DD"
+const shiftDay = (day, n) => {
+  const d = new Date(`${day}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+/**
+ * Visits reported in DHIS2 (South Sudan) as dispensing rows, like clinical
+ * dispenses: sachets the visit reported, on the visit day, for the product the
+ * implementation's DHIS2 configuration maps to.
+ */
+async function dhis2Dispensing({ facilityFilter, since }) {
+  const imports = await prisma.dhis2EventImport.findMany({
+    where: {
+      reportedSachets: { gt: 0 },
+      ...(facilityFilter !== undefined ? { facilityId: facilityFilter } : { facilityId: { not: null } }),
+      ...(since ? { occurredAt: { gte: since } } : {}),
+    },
+    select: { implementationId: true, facilityId: true, occurredAt: true, reportedSachets: true, shortfallSachets: true },
+    take: 500000,
+  });
+  if (!imports.length) return [];
+  const configs = await prisma.dhis2Config.findMany({
+    where: { implementationId: { in: [...new Set(imports.map((i) => i.implementationId))] } },
+    select: { implementationId: true, dispenseProductId: true },
+  });
+  const productFor = new Map(configs.map((c) => [c.implementationId, c.dispenseProductId]));
+  return imports
+    .filter((i) => i.occurredAt && productFor.get(i.implementationId))
+    .map((i) => ({
+      facilityId: i.facilityId,
+      productId: productFor.get(i.implementationId),
+      date: i.occurredAt,
+      sachets: i.reportedSachets,
+      shortfall: i.shortfallSachets,
+      source: "DHIS2",
+    }));
+}
+
 /**
  * Consumption-based stock position per facility+product.
  *
@@ -49,7 +93,7 @@ async function computeStockPositions({ facilityFilter, days, today }) {
   const visitWhere = { visitDate: { gte: lookbackStart } };
   if (facilityFilter !== undefined) visitWhere.facilityId = facilityFilter;
 
-  const [dispenses, stockAgg] = await Promise.all([
+  const [dispenses, stockAgg, reported] = await Promise.all([
     prisma.dispense.findMany({
       where: { boxId: { not: null }, visit: visitWhere },
       select: {
@@ -68,13 +112,25 @@ async function computeStockPositions({ facilityFilter, days, today }) {
       _count: { _all: true },
       _sum: { sachetsRemaining: true },
     }),
+    dhis2Dispensing({ facilityFilter, since: lookbackStart }),
   ]);
 
+  // Clinical dispenses (Kenya) and DHIS2-reported visits (South Sudan).
+  const rows = [
+    ...dispenses.map((d) => ({
+      facilityId: d.visit?.facilityId,
+      productId: d.box?.productId,
+      visitDate: d.visit?.visitDate,
+      quantitySachets: d.quantitySachets,
+    })),
+    ...reported.map((r) => ({ facilityId: r.facilityId, productId: r.productId, visitDate: r.date, quantitySachets: r.sachets })),
+  ];
+
   const pairs = new Map();
-  for (const d of dispenses) {
-    const facilityId = d.visit?.facilityId;
-    const productId = d.box?.productId;
-    const visitDate = d.visit?.visitDate;
+  for (const d of rows) {
+    const facilityId = d.facilityId;
+    const productId = d.productId;
+    const visitDate = d.visitDate;
     if (!facilityId || !productId || !visitDate) continue;
 
     const key = `${facilityId}__${productId}`;
@@ -756,10 +812,60 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
 
     const stockoutRisk = byProduct.filter((r) => r.isAtRisk);
 
+    // ---- Dispensed at this facility: clinical visits in Anchor and/or
+    //      visits reported in DHIS2, per local day.
+    const [clinical, reported] = await Promise.all([
+      prisma.dispense.findMany({
+        where: { visit: { facilityId } },
+        select: { quantitySachets: true, visit: { select: { visitDate: true } }, box: { select: { productId: true } } },
+        take: 500000,
+      }),
+      dhis2Dispensing({ facilityFilter: facilityId }),
+    ]);
+    const dispRows = [
+      ...clinical.filter((d) => d.visit?.visitDate).map((d) => ({ day: localDay(d.visit.visitDate), sachets: Number(d.quantitySachets) || 0, productId: d.box?.productId || null, shortfall: 0, source: "CLINICAL" })),
+      ...reported.map((r) => ({ day: localDay(r.date), sachets: r.sachets, productId: r.productId, shortfall: r.shortfall || 0, source: "DHIS2" })),
+    ];
+    const todayKey = localDay(new Date());
+    const windowFrom = shiftDay(todayKey, -(days - 1));
+    const sumWhere = (fn) => dispRows.reduce((n, r) => (fn(r) ? n + r.sachets : n), 0);
+    const perDay = new Map();
+    for (const r of dispRows) if (r.day >= windowFrom && r.day <= todayKey) perDay.set(r.day, (perDay.get(r.day) || 0) + r.sachets);
+    const byDay = [];
+    for (let d = windowFrom; d <= todayKey; d = shiftDay(d, 1)) byDay.push({ day: d, sachets: perDay.get(d) || 0 });
+    const dispProductIds = [...new Set(dispRows.map((r) => r.productId).filter(Boolean))];
+    const dispProducts = dispProductIds.length
+      ? await prisma.product.findMany({ where: { id: { in: dispProductIds } }, select: { id: true, code: true, name: true } })
+      : [];
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.from || "")) ? String(req.query.from) : null;
+    const to = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to || "")) ? String(req.query.to) : null;
+    const sources = [...new Set(dispRows.map((r) => r.source))];
+    const dispDays = dispRows.map((r) => r.day).sort();
+    const dispensed = {
+      source: sources.length > 1 ? "BOTH" : sources[0] || null,
+      timezone: REPORT_TIMEZONE,
+      today: sumWhere((r) => r.day === todayKey),
+      yesterday: sumWhere((r) => r.day === shiftDay(todayKey, -1)),
+      last7Days: sumWhere((r) => r.day >= shiftDay(todayKey, -6) && r.day <= todayKey),
+      lastWindow: sumWhere((r) => r.day >= windowFrom && r.day <= todayKey),
+      allTime: sumWhere(() => true),
+      firstDay: dispDays[0] || null,
+      lastDay: dispDays[dispDays.length - 1] || null,
+      notInStock: dispRows.reduce((n, r) => n + r.shortfall, 0),
+      byDay,
+      byProduct: dispProducts.map((p) => ({
+        product: p,
+        allTime: sumWhere((r) => r.productId === p.id),
+        lastWindow: sumWhere((r) => r.productId === p.id && r.day >= windowFrom && r.day <= todayKey),
+      })),
+      range: from || to ? { from, to, sachets: sumWhere((r) => (!from || r.day >= from) && (!to || r.day <= to)) } : null,
+    };
+
     return res.json({
       facility,
       unit: await stockUnitFor(req),
-      kpis: { boxesOnHand, sachetsRemaining },
+      kpis: { boxesOnHand, sachetsRemaining, sachetsDispensed: dispensed.allTime },
+      dispensed,
       byProduct,
       stockoutRisk,
       expiringSoon,
