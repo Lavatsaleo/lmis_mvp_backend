@@ -192,7 +192,25 @@ async function getScope(req) {
     facilityIdsFacilitiesOnly: [],
   };
 
+  const scopeFrom = (locations, assignedWarehouseId) => ({
+    mode: "WAREHOUSE",
+    warehouseId: assignedWarehouseId,
+    warehouseIds: locations.filter((f) => f.type === "WAREHOUSE").map((f) => f.id),
+    facilityIdsAll: locations.map((f) => f.id),
+    facilityIdsFacilitiesOnly: locations.filter((f) => f.type === "FACILITY").map((f) => f.id),
+  });
+
   if (role === "SUPER_ADMIN") {
+    // One country when the page asks for it (?implementationId=), so Kenya and
+    // South Sudan figures are not added together; otherwise all countries.
+    const requested = req.query?.implementationId ? String(req.query.implementationId) : null;
+    if (requested && requested !== "ALL") {
+      const locations = await prisma.facility.findMany({
+        where: { implementationId: requested },
+        select: { id: true, type: true },
+      });
+      return scopeFrom(locations, null);
+    }
     // ALL facilities
     const facs = await prisma.facility.findMany({
       where: { type: "FACILITY" },
@@ -206,14 +224,6 @@ async function getScope(req) {
       facilityIdsFacilitiesOnly: facs.map((f) => f.id),
     };
   }
-
-  const scopeFrom = (locations, assignedWarehouseId) => ({
-    mode: "WAREHOUSE",
-    warehouseId: assignedWarehouseId,
-    warehouseIds: locations.filter((f) => f.type === "WAREHOUSE").map((f) => f.id),
-    facilityIdsAll: locations.map((f) => f.id),
-    facilityIdsFacilitiesOnly: locations.filter((f) => f.type === "FACILITY").map((f) => f.id),
-  });
 
   // Whole country
   const countryId = countryWideImplementationId(req.user);

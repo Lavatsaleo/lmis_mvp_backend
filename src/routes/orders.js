@@ -2,19 +2,15 @@ const express = require("express");
 const router = express.Router();
 
 const prisma = require("../lib/prisma");
-const PDFDocument = require("pdfkit");
 
 // ✅ QR helpers
-const { buildBoxPayload, payloadToPngBuffer } = require("../utils/qr");
+const { writeA3Labels, sortBoxes } = require("../utils/labelSheet");
 
 // ✅ Auth + RBAC
 const { requireAuth } = require("../middleware/auth");
 const { requireRole } = require("../middleware/rbac");
 const { canOperateWarehouse, labelGenerationError } = require("../warehouse/common");
 
-function mmToPt(mm) {
-  return (mm * 72) / 25.4;
-}
 
 /**
  * POST /api/orders
@@ -435,118 +431,8 @@ router.get(
       if (req.user.role === "COUNTRY_ADMIN" && order.boxes.some((b) => b.product?.implementationId !== req.user.implementationId)) {
         return res.status(404).json({ message: "Order not found" });
       }
-      // Label order follows the running number (…-2 before …-10).
-      const collator = new Intl.Collator("en", { numeric: true });
-      order.boxes.sort((x, y) => collator.compare(x.boxUid, y.boxUid));
-
-      // FIXED PRINT SPECS 
-      const PAGE_W_MM = 420; // A3 landscape width
-      const PAGE_H_MM = 297; // A3 landscape height
-      const COLS = 8;
-      const ROWS = 10;
-
-      const LABEL_W_MM = 50.9;
-      const LABEL_H_MM = 28.4;
-      const QR_MM = 19.9;
-
-      // Center the whole grid on the page
-      const gridWmm = LABEL_W_MM * COLS;
-      const gridHmm = LABEL_H_MM * ROWS;
-
-      const marginXmm = (PAGE_W_MM - gridWmm) / 2; // ~6.4mm
-      const marginYmm = (PAGE_H_MM - gridHmm) / 2; // ~6.5mm
-
-      const pageW = mmToPt(PAGE_W_MM);
-      const pageH = mmToPt(PAGE_H_MM);
-
-      const marginX = mmToPt(marginXmm);
-      const marginY = mmToPt(marginYmm);
-
-      const cellW = mmToPt(LABEL_W_MM);
-      const cellH = mmToPt(LABEL_H_MM);
-
-      const qrSize = mmToPt(QR_MM);
-
-      // Padding / spacing inside a cell
-      const leftPad = mmToPt(2.0);
-      const rightPad = mmToPt(1.8);
-      const gap = mmToPt(2.0);
-
-      res.setHeader("Content-Type", "application/pdf");
-      // easier to download
-      res.setHeader("Content-Disposition", `attachment; filename="${order.orderNumber}_A3_80up.pdf"`);
-
-      const doc = new PDFDocument({
-        size: [pageW, pageH],
-        margins: { top: 0, left: 0, right: 0, bottom: 0 },
-      });
-
-      doc.pipe(res);
-
-      for (let i = 0; i < order.boxes.length; i++) {
-        const box = order.boxes[i];
-
-        // new page every 80
-        if (i > 0 && i % (COLS * ROWS) === 0) doc.addPage();
-
-        const indexOnPage = i % (COLS * ROWS);
-        const r = Math.floor(indexOnPage / COLS);
-        const c = indexOnPage % COLS;
-
-        const x = marginX + c * cellW;
-        const y = marginY + r * cellH;
-
-        // optional light border
-        doc.save().lineWidth(0.4).strokeColor("#E0E0E0").rect(x, y, cellW, cellH).stroke().restore();
-
-        const payload = buildBoxPayload({
-          boxUid: box.boxUid,
-          orderNumber: order.orderNumber,
-          productCode: box.product.code,
-          batchNo: box.batchNo,
-          expiryDate: box.expiryDate,
-          donorName: order.donorName || null,
-        });
-
-        const qrBuf = await payloadToPngBuffer(payload);
-
-        // ✅ QR vertically centered inside the label cell (less “crowded”)
-        const qrX = x + leftPad;
-        const qrY = y + (cellH - qrSize) / 2;
-
-        doc.image(qrBuf, qrX, qrY, { width: qrSize, height: qrSize });
-
-        // Text area to the right
-        const tx = qrX + qrSize + gap;
-        const tw = x + cellW - rightPad - tx;
-
-        // tighter, consistent text spacing
-        const expStr = new Date(box.expiryDate).toISOString().slice(0, 10);
-
-        // boxUid can wrap nicely because of hyphens
-        doc.fontSize(7).fillColor("#000000").text(box.boxUid, tx, y + mmToPt(4.0), {
-          width: tw,
-        });
-
-        doc.fontSize(6).fillColor("#222222").text(`Batch: ${box.batchNo}`, tx, y + mmToPt(11.0), {
-          width: tw,
-        });
-
-        doc.fontSize(6).fillColor("#222222").text(`Exp: ${expStr}`, tx, y + mmToPt(15.5), {
-          width: tw,
-        });
-
-        // The box's own donor (PO stock), else the order's free-text donor.
-        const donorLabel = box.donor?.name || order.donorName;
-        if (donorLabel) {
-          doc.fontSize(6).fillColor("#222222").text(`Donor: ${donorLabel}`, tx, y + mmToPt(20.0), {
-            width: tw,
-            ellipsis: true,
-          });
-        }
-      }
-
-      doc.end();
+      const boxes = sortBoxes(order.boxes.map((b) => ({ ...b, order })));
+      await writeA3Labels(res, boxes, `${order.orderNumber}_A3_80up.pdf`);
     } catch (err) {
       console.error(err);
       return res.status(500).json({ message: "Server error", error: String(err.message || err) });
