@@ -16,6 +16,12 @@ const implementationInclude = {
     select: { module: true },
     orderBy: { module: "asc" },
   },
+  // Children read from DHIS2 tracker programs (shows the Children page where
+  // the clinical module is off, e.g. South Sudan).
+  dhis2TrackerPrograms: {
+    where: { enabled: true },
+    select: { code: true },
+  },
 };
 
 function buildPlatformContext(user) {
@@ -37,6 +43,7 @@ function buildPlatformContext(user) {
       reportingCurrencyCode: implementation.reportingCurrencyCode || "USD",
       // Mobile stock-control tools (receive PO, stock count, report loss).
       warehouseTools: !!implementation.warehouseTools,
+      trackerPrograms: Array.isArray(implementation.dhis2TrackerPrograms) ? implementation.dhis2TrackerPrograms.map((p) => p.code) : [],
     },
     enabledModules: Array.isArray(implementation.modules)
       ? implementation.modules.map((row) => row.module)

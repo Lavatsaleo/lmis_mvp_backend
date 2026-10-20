@@ -418,6 +418,8 @@ function startScheduler() {
         await pull(c.implementationId);
         await push(c.implementationId);
       }
+      // Children from tracker programs (OTP, ...), on the same interval.
+      await require("./tracker").syncDueTrackerPrograms();
     } catch (err) {
       console.error("DHIS2 scheduler:", err.message || err);
     }
@@ -429,4 +431,4 @@ function startScheduler() {
 
 const isRunning = (implementationId) => running.has(`pull:${implementationId}`) || running.has(`push:${implementationId}`);
 
-module.exports = { pull, push, periodFor, serverWallNow, stockSnapshot, startScheduler, isRunning, applyTarget, deduct, giveBack };
+module.exports = { pull, push, periodFor, serverWallNow, wallTime, visitDay, dayAsDate, stockSnapshot, startScheduler, isRunning, applyTarget, deduct, giveBack };

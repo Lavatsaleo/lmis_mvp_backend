@@ -160,14 +160,15 @@ model Implementation {
 
   // Phase 1 links. These are nullable on the child models so the migration is
   // additive and safe for the existing Kenya production data.
-  facilities      Facility[]
-  users           User[]
-  products        Product[]
-  batchValuations ProductBatchValuation[]
-  counties        County[]
-  donors          Donor[]
-  purchaseOrders  PurchaseOrder[]
-  dhis2Config     Dhis2Config?
+  facilities           Facility[]
+  users                User[]
+  products             Product[]
+  batchValuations      ProductBatchValuation[]
+  counties             County[]
+  donors               Donor[]
+  purchaseOrders       PurchaseOrder[]
+  dhis2Config          Dhis2Config?
+  dhis2TrackerPrograms Dhis2TrackerProgram[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -754,6 +755,113 @@ model StockConsumptionLine {
 
   @@index([consumptionId])
   @@index([boxId])
+}
+
+// A DHIS2 tracker program whose children Anchor copies, read-only, for
+// patient-level review (e.g. OTP in South Sudan). DHIS2 stays the source.
+// `mapping` says which stages, attributes and data elements mean what;
+// `labels` keeps DHIS2 names so every recorded field can be shown.
+model Dhis2TrackerProgram {
+  id               String    @id @default(cuid())
+  implementationId String
+  programId        String
+  code             String
+  name             String
+  enabled          Boolean   @default(false)
+  // Commodity dispensed in this program (e.g. RUTF), shown as a number.
+  commodity        String?
+  // Enrolments before this date are not copied.
+  startDate        DateTime?
+  mapping          Json
+  labels           Json?
+  pullCursor       DateTime?
+  lastPullAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  implementation Implementation @relation(fields: [implementationId], references: [id])
+  children       Dhis2Child[]
+
+  @@unique([implementationId, programId])
+}
+
+// One enrolment of a child in a tracker program, as last read from DHIS2.
+model Dhis2Child {
+  id                String    @id @default(cuid())
+  programConfigId   String
+  implementationId  String
+  trackedEntityUid  String
+  enrollmentUid     String    @unique
+  orgUnitUid        String
+  orgUnitName       String?
+  orgUnitParentName String?
+  countyName        String?
+  // Anchor site linked to the org unit, when there is one.
+  facilityId        String?
+  patientId         String?
+  childName         String?
+  caregiverName     String?
+  sex               String?
+  dateOfBirth       DateTime?
+  // Age in months at enrolment.
+  ageMonths         Int?
+  addressPayam      String?
+  addressVillage    String?
+  enrolledAt        DateTime?
+  enrollmentStatus  String?
+  admissionType     String?
+  outcome           String?
+  outcomeDate       DateTime?
+  visitCount        Int       @default(0)
+  lastVisitDate     DateTime?
+  nextVisitDate     DateTime?
+  sachetsTotal      Int       @default(0)
+  lastWeightKg      Float?
+  lastMuacCm        Float?
+  lastWhz           Float?
+  deleted           Boolean   @default(false)
+  dhis2UpdatedAt    DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  programConfig Dhis2TrackerProgram @relation(fields: [programConfigId], references: [id], onDelete: Cascade)
+  visits        Dhis2ChildVisit[]
+
+  @@index([implementationId, programConfigId])
+  @@index([orgUnitUid])
+  @@index([facilityId])
+  @@index([patientId])
+  @@index([enrolledAt])
+}
+
+// One event (admission, follow-up visit, discharge) of a child's enrolment.
+model Dhis2ChildVisit {
+  id              String    @id @default(cuid())
+  childId         String
+  eventUid        String    @unique
+  stage           String
+  programStageUid String
+  status          String?
+  occurredAt      DateTime?
+  scheduledAt     DateTime?
+  weightKg        Float?
+  heightCm        Float?
+  muacCm          Float?
+  whz             Float?
+  oedema          String?
+  sachets         Int?
+  nutritionStatus String?
+  visitStatus     String?
+  nextVisitDate   DateTime?
+  outcome         String?
+  dataValues      Json?
+  deleted         Boolean   @default(false)
+  dhis2UpdatedAt  DateTime?
+
+  child Dhis2Child @relation(fields: [childId], references: [id], onDelete: Cascade)
+
+  @@index([childId])
+  @@index([occurredAt])
 }
 
 model Dhis2SyncRun {

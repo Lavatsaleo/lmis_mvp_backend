@@ -11,6 +11,7 @@ const { requireAdmin, adminImplementationId, canAdministerImplementation } = req
 const { audit } = require("../auth/audit");
 const client = require("../dhis2/client");
 const sync = require("../dhis2/sync");
+const tracker = require("../dhis2/tracker");
 
 router.use(requireAuth, requireAdmin);
 
@@ -407,6 +408,130 @@ router.get("/imports", async (req, res) => {
         .map((s) => ({ facilityId: s.facilityId, siteName: names.get(s.facilityId) || "(unmapped)", events: s._count._all, reported: s._sum.reportedSachets || 0, deducted: s._sum.deductedSachets || 0, shortfall: s._sum.shortfallSachets || 0 }))
         .sort((a, b) => b.reported - a.reported),
     });
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Tracker programs (children copied from DHIS2, e.g. OTP)
+// ---------------------------------------------------------------------------
+const trackerRow = async (p) => {
+  const [children, active, lastRun] = await Promise.all([
+    prisma.dhis2Child.count({ where: { programConfigId: p.id, deleted: false } }),
+    prisma.dhis2Child.count({ where: { programConfigId: p.id, deleted: false, outcome: null, enrollmentStatus: "ACTIVE" } }),
+    prisma.dhis2SyncRun.findFirst({ where: { implementationId: p.implementationId, direction: `TRACKER:${p.code}` }, orderBy: { startedAt: "desc" } }),
+  ]);
+  return {
+    id: p.id,
+    implementationId: p.implementationId,
+    programId: p.programId,
+    code: p.code,
+    name: p.name,
+    enabled: p.enabled,
+    commodity: p.commodity,
+    startDate: p.startDate,
+    lastPullAt: p.lastPullAt,
+    mapping: p.mapping,
+    labels: p.labels,
+    children,
+    inTreatment: active,
+    running: tracker.isTrackerRunning(p.id),
+    lastRun,
+  };
+};
+
+// GET /api/dhis2/tracker-programs?implementationId=
+router.get("/tracker-programs", async (req, res) => {
+  try {
+    const id = implId(req, res);
+    if (!id) return;
+    const rows = await prisma.dhis2TrackerProgram.findMany({ where: { implementationId: id }, orderBy: { code: "asc" } });
+    return res.json(await Promise.all(rows.map(trackerRow)));
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+const cleanCode = (v, fallback) => String(v || fallback || "").trim().slice(0, 20);
+const dateOrNullSafe = (v) => {
+  if (!v) return null;
+  const d = new Date(`${String(v).slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) throw Object.assign(new Error("Invalid start date"), { http: 400 });
+  return d;
+};
+
+// POST /api/dhis2/tracker-programs { implementationId, programId, code?, commodity?, startDate?, enabled? }
+router.post("/tracker-programs", async (req, res) => {
+  try {
+    const id = implId(req, res);
+    if (!id) return;
+    const programId = String(req.body?.programId || "").trim();
+    if (!UID.test(programId)) return res.status(400).json({ message: "Choose a DHIS2 tracker program" });
+    if (await prisma.dhis2TrackerProgram.findUnique({ where: { implementationId_programId: { implementationId: id, programId } } })) {
+      return res.status(409).json({ message: "This program is already added" });
+    }
+    const detected = await tracker.detectMapping(programId);
+    const created = await prisma.dhis2TrackerProgram.create({
+      data: {
+        implementationId: id,
+        programId,
+        name: detected.program.name,
+        code: cleanCode(req.body?.code, detected.program.name),
+        commodity: req.body?.commodity ? String(req.body.commodity).trim().slice(0, 40) : null,
+        startDate: dateOrNullSafe(req.body?.startDate),
+        enabled: !!req.body?.enabled,
+        mapping: detected.mapping,
+        labels: detected.labels,
+      },
+    });
+    await audit(req, { action: "DHIS2_TRACKER_PROGRAM_ADDED", targetType: "IMPLEMENTATION", target: { id, name: created.name }, implementationId: id, details: { programId, code: created.code } });
+    return res.status(201).json(await trackerRow(created));
+  } catch (err) {
+    if (err.http) return res.status(err.http).json({ message: err.message });
+    return fail(res, err);
+  }
+});
+
+// PATCH /api/dhis2/tracker-programs/:pid { enabled?, commodity?, startDate?, code?, remap? }
+router.patch("/tracker-programs/:pid", async (req, res) => {
+  try {
+    const p = await prisma.dhis2TrackerProgram.findUnique({ where: { id: String(req.params.pid) } });
+    if (!p || !canAdministerImplementation(req.user, p.implementationId)) return res.status(404).json({ message: "Program not found" });
+    const b = req.body || {};
+    const data = {};
+    if (b.enabled !== undefined) data.enabled = !!b.enabled;
+    if (b.commodity !== undefined) data.commodity = b.commodity ? String(b.commodity).trim().slice(0, 40) : null;
+    if (b.startDate !== undefined) data.startDate = dateOrNullSafe(b.startDate);
+    if (b.code !== undefined) data.code = cleanCode(b.code, p.code);
+    if (b.remap) {
+      const detected = await tracker.detectMapping(p.programId);
+      data.mapping = detected.mapping;
+      data.labels = detected.labels;
+      data.name = detected.program.name;
+    }
+    // A new start date or mapping needs a full re-read on the next sync.
+    if (data.startDate !== undefined || data.mapping) data.pullCursor = null;
+    const updated = await prisma.dhis2TrackerProgram.update({ where: { id: p.id }, data });
+    await audit(req, { action: "DHIS2_TRACKER_PROGRAM_CHANGED", targetType: "IMPLEMENTATION", target: { id: p.implementationId, name: p.name }, implementationId: p.implementationId, details: { ...b } });
+    return res.json(await trackerRow(updated));
+  } catch (err) {
+    if (err.http) return res.status(err.http).json({ message: err.message });
+    return fail(res, err);
+  }
+});
+
+// POST /api/dhis2/tracker-programs/:pid/sync { fromStart? }
+// Starts in the background (the first full read can take minutes) and returns at once.
+router.post("/tracker-programs/:pid/sync", async (req, res) => {
+  try {
+    const p = await prisma.dhis2TrackerProgram.findUnique({ where: { id: String(req.params.pid) } });
+    if (!p || !canAdministerImplementation(req.user, p.implementationId)) return res.status(404).json({ message: "Program not found" });
+    if (!client.isConfigured()) return res.status(503).json({ message: "DHIS2 is not configured on the server" });
+    if (tracker.isTrackerRunning(p.id)) return res.json({ started: false, message: "Already syncing" });
+    tracker.syncTrackerProgram(p.id, { trigger: "MANUAL", fromStart: !!req.body?.fromStart }).catch((e) => console.error("tracker sync", e));
+    await audit(req, { action: "DHIS2_TRACKER_SYNC", targetType: "IMPLEMENTATION", target: { id: p.implementationId, name: p.name }, implementationId: p.implementationId, details: { fromStart: !!req.body?.fromStart } });
+    return res.json({ started: true, message: p.pullCursor && !req.body?.fromStart ? "Reading changes from DHIS2" : "Reading all children from DHIS2; this can take a few minutes" });
   } catch (err) {
     return fail(res, err);
   }
