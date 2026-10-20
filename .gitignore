@@ -3,3 +3,6 @@ node_modules
 .env
 
 /generated/prisma
+
+# Working documents (SROs, POs, delivery notes): contain staff names, never commit
+Working files/

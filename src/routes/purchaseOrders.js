@@ -592,7 +592,7 @@ router.post("/:id/receipts", requireRole(...OPERATOR_ROLES), async (req, res) =>
     // A plain date (yyyy-mm-dd) means "that day": today -> now; an earlier day
     // -> midday UTC, so it shows on the right date in every African time zone.
     let receivedAt = dateOrNull(body.receivedAt, "Received date") || new Date();
-    if (/^d{4}-d{2}-d{2}$/.test(String(body.receivedAt || ""))) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(body.receivedAt || ""))) {
       const todayIso = new Date().toISOString().slice(0, 10);
       receivedAt = body.receivedAt === todayIso ? new Date() : new Date(`${body.receivedAt}T12:00:00.000Z`);
     }
