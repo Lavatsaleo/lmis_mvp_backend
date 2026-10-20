@@ -138,7 +138,7 @@ router.get("/programs", async (req, res) => {
     return res.json(
       programs
         .filter((p) => p.enabled || byProgram.get(p.id))
-        .map((p) => ({ id: p.id, code: p.code, name: p.name, commodity: p.commodity, children: byProgram.get(p.id) || 0, lastPullAt: p.lastPullAt, startDate: p.startDate }))
+        .map((p) => ({ id: p.id, implementationId: p.implementationId, code: p.code, name: p.name, commodity: p.commodity, children: byProgram.get(p.id) || 0, lastPullAt: p.lastPullAt, startDate: p.startDate }))
     );
   } catch (err) {
     return fail(res, err);

@@ -1,19 +1,21 @@
 // DHIS2 integration admin: connection check, metadata pickers, configuration,
 // site <-> organisation unit mapping, manual sync, run history and imports.
-// SUPER_ADMIN (any implementation) and COUNTRY_ADMIN (own implementation).
+// SUPER_ADMIN only: the connection and settings affect every country's data.
 
 const express = require("express");
 const router = express.Router();
 
 const prisma = require("../lib/prisma");
 const { requireAuth } = require("../middleware/auth");
-const { requireAdmin, adminImplementationId, canAdministerImplementation } = require("../auth/access");
+const { adminImplementationId, canAdministerImplementation } = require("../auth/access");
 const { audit } = require("../auth/audit");
 const client = require("../dhis2/client");
 const sync = require("../dhis2/sync");
 const tracker = require("../dhis2/tracker");
 
-router.use(requireAuth, requireAdmin);
+router.use(requireAuth, (req, res, next) =>
+  req.user?.role === "SUPER_ADMIN" ? next() : res.status(403).json({ message: "Only a Super Admin can manage the DHIS2 integration" })
+);
 
 const SITE_TYPES = ["CLINIC_STORE", "PHARMACY_STORE", "OTHER"];
 const PERIOD_TYPES = new Set(["Daily", "Weekly", "Monthly"]);
