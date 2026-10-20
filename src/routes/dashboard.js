@@ -705,6 +705,54 @@ router.get("/alerts", requireAuth, async (req, res) => {
 //  - expiryWarnDays=60
 //  - stockoutThresholdDays=14
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// GET /api/dashboard/facility-list?implementationId=
+// Facilities in the user's scope for the Facility Store picker: where each one
+// is (county, supplying warehouse) and what it holds now.
+// -----------------------------------------------------------------------------
+router.get("/facility-list", requireAuth, async (req, res) => {
+  try {
+    const scope = await getScope(req);
+    const where = { type: "FACILITY" };
+    if (scope.mode !== "ALL") where.id = { in: scope.facilityIdsFacilitiesOnly };
+    const facilities = await prisma.facility.findMany({
+      where,
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        county: { select: { name: true } },
+        parentStockLocation: { select: { name: true } },
+        warehouse: { select: { name: true } },
+        implementation: { select: { country: { select: { name: true } } } },
+      },
+    });
+    const stock = await prisma.box.groupBy({
+      by: ["currentFacilityId"],
+      where: { status: "IN_FACILITY", currentFacilityId: { in: facilities.map((f) => f.id) } },
+      _count: { _all: true },
+      _sum: { sachetsRemaining: true },
+    });
+    const stockBy = new Map(stock.map((r) => [r.currentFacilityId, r]));
+    const rows = facilities
+      .map((f) => ({
+        id: f.id,
+        code: f.code,
+        name: f.name,
+        county: f.county?.name || null,
+        suppliedBy: f.parentStockLocation?.name || f.warehouse?.name || null,
+        country: f.implementation?.country?.name || null,
+        boxesOnHand: stockBy.get(f.id)?._count._all || 0,
+        sachetsOnHand: stockBy.get(f.id)?._sum.sachetsRemaining || 0,
+      }))
+      .sort((a, b) => String(a.suppliedBy || "").localeCompare(String(b.suppliedBy || "")) || a.name.localeCompare(b.name));
+    return res.json({ rows });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
 router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
   try {
     const facilityId = String(req.params.facilityId);
@@ -721,7 +769,17 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
 
     const facility = await prisma.facility.findUnique({
       where: { id: facilityId },
-      select: { id: true, code: true, name: true, type: true, warehouseId: true },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        type: true,
+        warehouseId: true,
+        county: { select: { name: true } },
+        parentStockLocation: { select: { name: true } },
+        warehouse: { select: { name: true } },
+        implementation: { select: { country: { select: { name: true } } } },
+      },
     });
 
     if (!facility || facility.type !== "FACILITY") {
@@ -861,10 +919,60 @@ router.get("/facilities/:facilityId/store", requireAuth, async (req, res) => {
       range: from || to ? { from, to, sachets: sumWhere((r) => (!from || r.day >= from) && (!to || r.day <= to)) } : null,
     };
 
+    // ---- What is on the shelf, by batch (earliest expiry first)
+    const batchRows = await prisma.box.groupBy({
+      by: ["productId", "batchNo", "expiryDate"],
+      where: { status: "IN_FACILITY", currentFacilityId: facilityId },
+      _count: { _all: true },
+      _sum: { sachetsRemaining: true },
+      orderBy: { expiryDate: "asc" },
+    });
+    const batches = batchRows.map((b) => ({
+      product: productMap.get(b.productId) || { id: b.productId },
+      batchNo: b.batchNo,
+      expiryDate: b.expiryDate,
+      boxes: b._count._all,
+      sachets: b._sum.sachetsRemaining || 0,
+    }));
+
+    // ---- Deliveries: on the way here, and recently received
+    const shipmentSelect = {
+      id: true,
+      manifestNo: true,
+      status: true,
+      dispatchedAt: true,
+      receivedAt: true,
+      fromWarehouse: { select: { name: true } },
+      _count: { select: { items: true } },
+    };
+    const [incoming, received] = await Promise.all([
+      prisma.shipment.findMany({ where: { toFacilityId: facilityId, status: "DISPATCHED" }, orderBy: { dispatchedAt: "desc" }, take: 10, select: shipmentSelect }),
+      prisma.shipment.findMany({ where: { toFacilityId: facilityId, status: "RECEIVED" }, orderBy: { receivedAt: "desc" }, take: 5, select: shipmentSelect }),
+    ]);
+    const shipmentRow = (x) => ({
+      id: x.id,
+      manifestNo: x.manifestNo,
+      from: x.fromWarehouse?.name || null,
+      dispatchedAt: x.dispatchedAt,
+      receivedAt: x.receivedAt,
+      boxes: x._count.items,
+    });
+
     return res.json({
-      facility,
+      facility: {
+        id: facility.id,
+        code: facility.code,
+        name: facility.name,
+        type: facility.type,
+        county: facility.county?.name || null,
+        suppliedBy: facility.parentStockLocation?.name || facility.warehouse?.name || null,
+        country: facility.implementation?.country?.name || null,
+      },
       unit: await stockUnitFor(req),
       kpis: { boxesOnHand, sachetsRemaining, sachetsDispensed: dispensed.allTime },
+      batches,
+      nextExpiry: batches[0]?.expiryDate || null,
+      deliveries: { incoming: incoming.map(shipmentRow), received: received.map(shipmentRow) },
       dispensed,
       byProduct,
       stockoutRisk,
