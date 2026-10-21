@@ -228,6 +228,9 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
+// Exports carry no personal identifiers: only the Patient ID identifies a child
+// (no child or caregiver names, date of birth or home address). Names stay on
+// screen, for register checks, but never leave Anchor in a file.
 router.get("/export.csv", async (req, res) => {
   try {
     const where = await buildWhere(req);
@@ -241,21 +244,21 @@ router.get("/export.csv", async (req, res) => {
     });
     const lines = [];
     if (visitsLevel) {
-      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Child name", "Sex", "Caregiver", "Visit type", "Status", "Date", "Scheduled", "Weight (kg)", "Height (cm)", "MUAC (cm)", "WHZ", "Oedema", "Treatment given", "Commodity", "Amount", "Unit", "Nutrition status", "Visit status", "Next visit", "Outcome"].join(","));
+      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Sex", "Age at admission (months)", "Visit type", "Status", "Date", "Scheduled", "Weight (kg)", "Height (cm)", "MUAC (cm)", "WHZ", "Oedema", "Treatment given", "Commodity", "Amount", "Unit", "Nutrition status", "Visit status", "Next visit", "Outcome"].join(","));
       for (const c of children) {
         for (const v of c.visits) {
           lines.push(
-            [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.childName, c.sex, c.caregiverName, v.stage, v.status, v.occurredAt, v.scheduledAt, v.weightKg, v.heightCm, v.muacCm, v.whz, v.oedema, v.treatment, (v.commodities || [])[0]?.commodity, (v.commodities || [])[0]?.amount, (v.commodities || [])[0]?.unit, v.nutritionStatus, v.visitStatus, v.nextVisitDate, v.outcome]
+            [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.sex, c.ageMonths, v.stage, v.status, v.occurredAt, v.scheduledAt, v.weightKg, v.heightCm, v.muacCm, v.whz, v.oedema, v.treatment, (v.commodities || [])[0]?.commodity, (v.commodities || [])[0]?.amount, (v.commodities || [])[0]?.unit, v.nutritionStatus, v.visitStatus, v.nextVisitDate, v.outcome]
               .map(csvCell)
               .join(",")
           );
         }
       }
     } else {
-      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Child name", "Sex", "Date of birth", "Age at admission (months)", "Caregiver", "Payam (address)", "Village/Boma", "Admitted", "Admission type", "Visits", "Last visit", "Next visit", "Status", "Outcome date", "Given in total", "Last weight (kg)", "Last MUAC (cm)", "Last WHZ"].join(","));
+      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Sex", "Age at admission (months)", "Admitted", "Admission type", "Visits", "Last visit", "Next visit", "Status", "Outcome date", "Given in total", "Last weight (kg)", "Last MUAC (cm)", "Last WHZ"].join(","));
       for (const c of children) {
         lines.push(
-          [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.childName, c.sex, c.dateOfBirth, c.ageMonths, c.caregiverName, c.addressPayam, c.addressVillage, c.enrolledAt, c.admissionType, c.visitCount, c.lastVisitDate, c.nextVisitDate, statusOf(c), c.outcomeDate, givenText(c.commodityTotals), c.lastWeightKg, c.lastMuacCm, c.lastWhz]
+          [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.sex, c.ageMonths, c.enrolledAt, c.admissionType, c.visitCount, c.lastVisitDate, c.nextVisitDate, statusOf(c), c.outcomeDate, givenText(c.commodityTotals), c.lastWeightKg, c.lastMuacCm, c.lastWhz]
             .map(csvCell)
             .join(",")
         );
@@ -265,7 +268,7 @@ router.get("/export.csv", async (req, res) => {
       action: "CHILDREN_EXPORTED",
       targetType: "IMPLEMENTATION",
       target: { id: req.query.implementationId || req.user.implementationId || "all", name: "DHIS2 children" },
-      details: { level: visitsLevel ? "visits" : "children", children: children.length, filters: req.query },
+      details: { level: visitsLevel ? "visits" : "children", children: children.length, filters: { ...req.query, q: req.query.q ? "(search)" : undefined } },
     });
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="children-${visitsLevel ? "visits" : "list"}-${new Date().toISOString().slice(0, 10)}.csv"`);

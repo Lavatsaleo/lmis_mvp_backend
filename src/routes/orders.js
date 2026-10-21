@@ -432,7 +432,7 @@ router.get(
         return res.status(404).json({ message: "Order not found" });
       }
       const boxes = sortBoxes(order.boxes.map((b) => ({ ...b, order })));
-      await writeA3Labels(res, boxes, `${order.orderNumber}_A3_80up.pdf`);
+      await writeA3Labels(res, boxes, `${order.orderNumber}.pdf`, req.query.format);
     } catch (err) {
       console.error(err);
       return res.status(500).json({ message: "Server error", error: String(err.message || err) });

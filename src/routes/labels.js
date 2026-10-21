@@ -186,7 +186,7 @@ router.get("/locations/:facilityId/print/a3", requireRole(...PRINT_ROLES), async
       include: { product: true, donor: { select: { name: true } }, order: { select: { orderNumber: true, donorName: true } } },
     });
     if (!boxes.length) return res.status(404).json({ message: "No boxes at this location" });
-    await writeA3Labels(res, sortBoxes(boxes), `${location.code}_labels_A3_80up.pdf`);
+    await writeA3Labels(res, sortBoxes(boxes), `${location.code}_labels.pdf`, req.query.format);
   } catch (err) {
     console.error(err);
     if (!res.headersSent) return res.status(500).json({ message: "Server error", error: String(err.message || err) });
