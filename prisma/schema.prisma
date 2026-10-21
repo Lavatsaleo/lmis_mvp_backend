@@ -169,6 +169,7 @@ model Implementation {
   purchaseOrders       PurchaseOrder[]
   dhis2Config          Dhis2Config?
   dhis2TrackerPrograms Dhis2TrackerProgram[]
+  mapSites             MapSite[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1365,4 +1366,27 @@ model DuplicateCase {
   @@index([status])
   @@index([source])
   @@index([createdAt])
+}
+
+// Where a programme site is, for the map: from the country's GPS list (e.g.
+// "ACF GPS coordinate.xlsx"). Matched to DHIS2 sites by name, so it works for
+// sites that are not Anchor stock locations. `issues` notes anything to check.
+model MapSite {
+  id               String   @id @default(cuid())
+  implementationId String
+  name             String
+  state            String?
+  county           String?
+  payam            String?
+  latitude         Float?
+  longitude        Float?
+  issues           Json?
+  source           String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  implementation Implementation @relation(fields: [implementationId], references: [id])
+
+  @@unique([implementationId, name])
+  @@index([implementationId])
 }

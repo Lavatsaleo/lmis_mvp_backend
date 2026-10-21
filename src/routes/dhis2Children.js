@@ -14,6 +14,8 @@ const { requireAuth } = require("../middleware/auth");
 const { isSuperAdmin, countryWideImplementationId, locationWithDescendants } = require("../auth/access");
 const { audit } = require("../auth/audit");
 const { optionName } = require("../dhis2/tracker");
+const { siteMatcher } = require("../dhis2/siteMatch");
+const { Prisma } = require("@prisma/client");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -274,6 +276,121 @@ router.get("/export.csv", async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="children-${visitsLevel ? "visits" : "list"}-${new Date().toISOString().slice(0, 10)}.csv"`);
     // BOM so Excel opens names with accents correctly.
     return res.send("﻿" + lines.join("\r\n"));
+  } catch (err) {
+    return fail(res, err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/dhis2-children/map?implementationId=&programIds=a,b&from=&to=
+// Workload and results per site for the programme map: admissions in the
+// period, children in treatment now, discharges by outcome in the period and
+// commodities given in the period, with each site's coordinates.
+// ---------------------------------------------------------------------------
+const OUTCOME_GROUPS = [
+  ["cured", /cured|recovered/i],
+  ["died", /died|death|dead/i],
+  ["defaulted", /default/i],
+  ["nonResponse", /non.?respon/i],
+];
+const outcomeGroup = (o) => OUTCOME_GROUPS.find(([, re]) => re.test(String(o || "")))?.[0] || "otherExits";
+
+router.get("/map", async (req, res) => {
+  try {
+    const scope = await childScope(req);
+    if (!scope) return res.status(403).json({ message: "Your account cannot view children" });
+    const implWhere = scope.implementationId ? { implementationId: scope.implementationId } : isSuperAdmin(req.user) ? {} : { implementationId: req.user.implementationId || "__none__" };
+    const programs = await prisma.dhis2TrackerProgram.findMany({ where: implWhere, select: { id: true, code: true, name: true, implementationId: true }, orderBy: { code: "asc" } });
+    const wanted = String(req.query.programIds || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    const programIds = wanted.length ? programs.filter((p) => wanted.includes(p.id)).map((p) => p.id) : programs.map((p) => p.id);
+    const from = dayStart(req.query.from);
+    const to = dayEnd(req.query.to);
+    const inPeriod = from || to ? { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } : null;
+    const base = { AND: [{ deleted: false }, scope, { programConfigId: { in: programIds } }] };
+    const today = startOfTodayUtc();
+
+    const by = ["orgUnitUid", "programConfigId"];
+    const [meta, admissions, active, missed, exits] = await Promise.all([
+      prisma.dhis2Child.groupBy({ by: ["orgUnitUid", "orgUnitName", "orgUnitParentName", "countyName", "facilityId"], where: base, _count: { _all: true } }),
+      prisma.dhis2Child.groupBy({ by, where: { AND: [base, ...(inPeriod ? [{ enrolledAt: inPeriod }] : [])] }, _count: { _all: true } }),
+      prisma.dhis2Child.groupBy({ by, where: { AND: [base, { outcome: null, enrollmentStatus: "ACTIVE" }] }, _count: { _all: true } }),
+      prisma.dhis2Child.groupBy({ by, where: { AND: [base, { outcome: null, enrollmentStatus: "ACTIVE", nextVisitDate: { lt: today } }] }, _count: { _all: true } }),
+      prisma.dhis2Child.groupBy({ by: [...by, "outcome"], where: { AND: [base, { outcome: { not: null } }, ...(inPeriod ? [{ outcomeDate: inPeriod }] : [])] }, _count: { _all: true } }),
+    ]);
+
+    // Commodities given in the period, per site and program.
+    const scopeSql = [];
+    if (scope.implementationId) scopeSql.push(Prisma.sql`c.implementationId = ${scope.implementationId}`);
+    if (scope.facilityId?.in) scopeSql.push(scope.facilityId.in.length ? Prisma.sql`c.facilityId IN (${Prisma.join(scope.facilityId.in)})` : Prisma.sql`1 = 0`);
+    else if (typeof scope.facilityId === "string") scopeSql.push(Prisma.sql`c.facilityId = ${scope.facilityId}`);
+    const given = programIds.length
+      ? await prisma.$queryRaw`
+          SELECT c.orgUnitUid AS orgUnitUid, c.programConfigId AS programConfigId, g.commodity AS commodity, g.unit AS unit, SUM(g.amount) AS amount
+          FROM \`Dhis2VisitCommodity\` g JOIN \`Dhis2Child\` c ON c.id = g.childId
+          WHERE c.deleted = false AND c.programConfigId IN (${Prisma.join(programIds)})
+            ${scopeSql.length ? Prisma.sql`AND ${Prisma.join(scopeSql, " AND ")}` : Prisma.empty}
+            ${from ? Prisma.sql`AND g.occurredAt >= ${from}` : Prisma.empty}
+            ${to ? Prisma.sql`AND g.occurredAt <= ${to}` : Prisma.empty}
+          GROUP BY c.orgUnitUid, c.programConfigId, g.commodity, g.unit`
+      : [];
+
+    // Coordinates from the GPS list, matched by name.
+    const implIds = [...new Set(programs.map((p) => p.implementationId))];
+    const mapSites = await prisma.mapSite.findMany({ where: { implementationId: { in: implIds.length ? implIds : [scope.implementationId || "__none__"] } } });
+    const match = siteMatcher(mapSites);
+
+    const sites = new Map();
+    for (const m of meta) {
+      const prev = sites.get(m.orgUnitUid);
+      if (prev) continue;
+      const loc = match(m.orgUnitName, m.countyName);
+      sites.set(m.orgUnitUid, {
+        key: m.orgUnitUid,
+        name: m.orgUnitName,
+        payam: m.orgUnitParentName,
+        county: (m.countyName || loc?.county || "").replace(/\s+county$/i, "") || null,
+        state: loc?.state || null,
+        latitude: loc?.latitude ?? null,
+        longitude: loc?.longitude ?? null,
+        gpsName: loc?.name || null,
+        issues: loc?.issues || null,
+        inAnchor: !!m.facilityId,
+        programs: {},
+        given: [],
+      });
+    }
+    const slot = (orgUnitUid, programConfigId) => {
+      const site = sites.get(orgUnitUid);
+      if (!site) return null;
+      site.programs[programConfigId] = site.programs[programConfigId] || { admissions: 0, inTreatment: 0, missed: 0, cured: 0, died: 0, defaulted: 0, nonResponse: 0, otherExits: 0 };
+      return site.programs[programConfigId];
+    };
+    for (const r of admissions) { const x = slot(r.orgUnitUid, r.programConfigId); if (x) x.admissions = r._count._all; }
+    for (const r of active) { const x = slot(r.orgUnitUid, r.programConfigId); if (x) x.inTreatment = r._count._all; }
+    for (const r of missed) { const x = slot(r.orgUnitUid, r.programConfigId); if (x) x.missed = r._count._all; }
+    for (const r of exits) { const x = slot(r.orgUnitUid, r.programConfigId); if (x) x[outcomeGroup(r.outcome)] += r._count._all; }
+    for (const r of given) {
+      const site = sites.get(r.orgUnitUid);
+      if (site) site.given.push({ programConfigId: r.programConfigId, commodity: r.commodity, unit: r.unit, amount: Math.round(Number(r.amount) * 100) / 100 });
+    }
+
+    // GPS-list sites with no records yet (country-wide views only).
+    const usedGps = new Set([...sites.values()].map((x) => x.gpsName).filter(Boolean));
+    const countryWide = !scope.facilityId;
+    const idleSites = countryWide
+      ? mapSites.filter((m) => !usedGps.has(m.name)).map((m) => ({ name: m.name, state: m.state, county: m.county, payam: m.payam, latitude: m.latitude, longitude: m.longitude, issues: m.issues }))
+      : [];
+
+    return res.json({
+      period: { from: req.query.from || null, to: req.query.to || null },
+      programs: programs.map(({ id, code, name }) => ({ id, code, name, selected: programIds.includes(id) })),
+      sites: [...sites.values()],
+      idleSites,
+      gpsIssues: countryWide ? mapSites.filter((m) => Array.isArray(m.issues) && m.issues.length).map((m) => ({ name: m.name, county: m.county, issues: m.issues })) : [],
+    });
   } catch (err) {
     return fail(res, err);
   }

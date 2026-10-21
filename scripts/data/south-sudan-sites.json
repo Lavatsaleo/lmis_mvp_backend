@@ -1,0 +1,1249 @@
+{
+ "source": "ACF GPS coordinate.xlsx (Action Against Hunger South Sudan)",
+ "generated": "2026-10-21",
+ "sites": [
+  {
+   "name": "Lieth OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Malualbai",
+   "latitude": 9.25,
+   "longitude": 27.783611,
+   "issues": []
+  },
+  {
+   "name": "Warawar OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.15,
+   "longitude": 27.616944,
+   "issues": []
+  },
+  {
+   "name": "Bakou OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.433333,
+   "longitude": 27.608889,
+   "issues": []
+  },
+  {
+   "name": "Warbekdit OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.299167,
+   "longitude": 27.533889,
+   "issues": []
+  },
+  {
+   "name": "Omdurman OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.235,
+   "longitude": 27.516667,
+   "issues": []
+  },
+  {
+   "name": "Marol Ajuong OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Mangar Tong I",
+   "latitude": 9.266667,
+   "longitude": 27.461667,
+   "issues": []
+  },
+  {
+   "name": "Malualdit OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Yargot",
+   "latitude": 9.249444,
+   "longitude": 27.35,
+   "issues": []
+  },
+  {
+   "name": "Wunlang OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Wunlang",
+   "latitude": 9.154444,
+   "longitude": 27.436389,
+   "issues": []
+  },
+  {
+   "name": "Rialdit OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Mangar Tong I",
+   "latitude": 9.135833,
+   "longitude": 27.513333,
+   "issues": []
+  },
+  {
+   "name": "Mangar Tong OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Mangar Tong I",
+   "latitude": 9.078611,
+   "longitude": 27.55,
+   "issues": []
+  },
+  {
+   "name": "Majok Akeen OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.433333,
+   "longitude": 27.483056,
+   "issues": []
+  },
+  {
+   "name": "Rumwetkor OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.398889,
+   "longitude": 27.415556,
+   "issues": []
+  },
+  {
+   "name": "Warmalual OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.5925,
+   "longitude": 27.393611,
+   "issues": []
+  },
+  {
+   "name": "Warlang OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Yargot",
+   "latitude": 9.437778,
+   "longitude": 27.237778,
+   "issues": []
+  },
+  {
+   "name": "Malualkon OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.013378,
+   "longitude": 27.624429,
+   "issues": []
+  },
+  {
+   "name": "Mayom Wel OTp",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Mangar Tong II",
+   "latitude": 8.75,
+   "longitude": 27.45,
+   "issues": []
+  },
+  {
+   "name": "Yargot OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Yargot",
+   "latitude": 9.014167,
+   "longitude": 27.465278,
+   "issues": []
+  },
+  {
+   "name": "Akuem OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Yargot",
+   "latitude": 8.962217,
+   "longitude": 27.499671,
+   "issues": []
+  },
+  {
+   "name": "Angot OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.502778,
+   "longitude": 27.593333,
+   "issues": []
+  },
+  {
+   "name": "Majok Yith Thiou",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Madhol",
+   "latitude": 9.7,
+   "longitude": 27.789167,
+   "issues": [
+    "coordinates fall outside South Sudan (11 km from Aweil East)"
+   ]
+  },
+  {
+   "name": "Malith OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Madhol",
+   "latitude": 9.45,
+   "longitude": 27.716667,
+   "issues": []
+  },
+  {
+   "name": "Wanyjok OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Mangar Tong I",
+   "latitude": 9.016667,
+   "longitude": 27.583333,
+   "issues": []
+  },
+  {
+   "name": "Mayen Adhoot OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.064167,
+   "longitude": 27.616667,
+   "issues": []
+  },
+  {
+   "name": "Titchok OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Mangar Tong I",
+   "latitude": 8.863611,
+   "longitude": 27.5425,
+   "issues": []
+  },
+  {
+   "name": "Rumrol OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Madhol",
+   "latitude": 9.25,
+   "longitude": 27.783611,
+   "issues": [
+    "same coordinates as Lieth OTP"
+   ]
+  },
+  {
+   "name": "Mathiangnientok OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Malualbaai",
+   "latitude": 9.210833,
+   "longitude": 27.869444,
+   "issues": []
+  },
+  {
+   "name": "Ameth Gol Duang OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Malualbaai",
+   "latitude": 8.966667,
+   "longitude": 27.8,
+   "issues": []
+  },
+  {
+   "name": "Peth OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Malualbaai",
+   "latitude": 8.966667,
+   "longitude": 27.8,
+   "issues": [
+    "same coordinates as Ameth Gol Duang OTP"
+   ]
+  },
+  {
+   "name": "Mabok Tong OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Madhol",
+   "latitude": 8.983333,
+   "longitude": 27.716667,
+   "issues": []
+  },
+  {
+   "name": "Mabilbiet OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Malualbaai",
+   "latitude": 9.210833,
+   "longitude": 27.869722,
+   "issues": []
+  },
+  {
+   "name": "Ameth Akok OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Malualbaai",
+   "latitude": 9.132222,
+   "longitude": 27.771111,
+   "issues": []
+  },
+  {
+   "name": "Malualkon SC",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Baac",
+   "latitude": 9.014102,
+   "longitude": 27.624645,
+   "issues": []
+  },
+  {
+   "name": "Madhol OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Madhol",
+   "latitude": 9.045,
+   "longitude": 27.705,
+   "issues": []
+  },
+  {
+   "name": "Malualbaai OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil East",
+   "payam": "Malualbaai",
+   "latitude": 9.065,
+   "longitude": 27.766667,
+   "issues": []
+  },
+  {
+   "name": "Mangok OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Mangok",
+   "latitude": 9.131006,
+   "longitude": 27.387391,
+   "issues": [
+    "coordinates are 42 km outside Aweil Centre, in Aweil East county"
+   ]
+  },
+  {
+   "name": "Mabior Wundiing",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Mangok",
+   "latitude": 9.042283,
+   "longitude": 27.385117,
+   "issues": [
+    "latitude and longitude were in each other's columns (fixed)",
+    "coordinates are 32 km outside Aweil Centre, in Aweil East county"
+   ]
+  },
+  {
+   "name": "Langurukec OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Aroyo",
+   "latitude": 8.638056,
+   "longitude": 27.12,
+   "issues": []
+  },
+  {
+   "name": "Maluil AKot OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Bar Mayen",
+   "latitude": 8.528056,
+   "longitude": 27.771667,
+   "issues": []
+  },
+  {
+   "name": "Kabat OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Bar Mayen",
+   "latitude": 8.320556,
+   "longitude": 27.569722,
+   "issues": []
+  },
+  {
+   "name": "Alok OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Bar Mayen",
+   "latitude": 8.443056,
+   "longitude": 27.525833,
+   "issues": []
+  },
+  {
+   "name": "Aroyo OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Aroyo",
+   "latitude": 8.675912,
+   "longitude": 26.857055,
+   "issues": []
+  },
+  {
+   "name": "Aulic OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Aluic",
+   "latitude": 8.838611,
+   "longitude": 27.423889,
+   "issues": []
+  },
+  {
+   "name": "Bar Mayen OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Bar Mayen",
+   "latitude": 8.359722,
+   "longitude": 27.614722,
+   "issues": []
+  },
+  {
+   "name": "Kuom OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Aulic",
+   "latitude": 8.721667,
+   "longitude": 27.415833,
+   "issues": []
+  },
+  {
+   "name": "Mabok Akot OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Chel South",
+   "latitude": 8.888889,
+   "longitude": 27.894722,
+   "issues": [
+    "coordinates are 45 km outside Aweil Centre, in Aweil South county"
+   ]
+  },
+  {
+   "name": "Baau OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Bar Mayen",
+   "latitude": 8.439167,
+   "longitude": 27.759167,
+   "issues": []
+  },
+  {
+   "name": "Gabat OTP",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil Centre",
+   "payam": "Aulic",
+   "latitude": 8.759326,
+   "longitude": 27.385448,
+   "issues": [
+    "state/county missing in the sheet (taken from the row above)"
+   ]
+  },
+  {
+   "name": "Barlana Outreach site",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil West",
+   "payam": "Barmayen",
+   "latitude": 8.518753,
+   "longitude": 27.521453,
+   "issues": [
+    "coordinates are 28 km outside Aweil West, in Aweil Centre county"
+   ]
+  },
+  {
+   "name": "Panjap",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil South",
+   "payam": "Barmayen",
+   "latitude": 8.600403,
+   "longitude": 27.486308,
+   "issues": []
+  },
+  {
+   "name": "Nyalath",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil South",
+   "payam": "Nyalath",
+   "latitude": 8.711594,
+   "longitude": 27.475023,
+   "issues": [
+    "corrected: 8.711594, 27.285014 read as degrees and minutes (8.71159, 27.47502), which is inside Aweil South; please confirm"
+   ]
+  },
+  {
+   "name": "Machot",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil South",
+   "payam": "Chel South",
+   "latitude": 8.753364,
+   "longitude": 26.866606,
+   "issues": [
+    "coordinates are 59 km outside Aweil South, in Aweil Centre county"
+   ]
+  },
+  {
+   "name": "Akuang Kar",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil South",
+   "payam": "Chel South",
+   "latitude": 8.808236,
+   "longitude": 26.851172,
+   "issues": [
+    "coordinates are 62 km outside Aweil South, in Aweil Centre county"
+   ]
+  },
+  {
+   "name": "Awada",
+   "state": "Northern Bahr el Ghazal",
+   "county": "Aweil South",
+   "payam": "Awoda",
+   "latitude": 8.068433,
+   "longitude": 26.839406,
+   "issues": [
+    "coordinates are 87 km outside Aweil South, in Aweil Centre county"
+   ]
+  },
+  {
+   "name": "Duk Padiet",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.752869,
+   "longitude": 31.393988,
+   "issues": []
+  },
+  {
+   "name": "Payuel",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.48257,
+   "longitude": 31.5107,
+   "issues": []
+  },
+  {
+   "name": "Poktap",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.45833,
+   "longitude": 31.41281,
+   "issues": []
+  },
+  {
+   "name": "Pajut",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.4258,
+   "longitude": 31.68114,
+   "issues": []
+  },
+  {
+   "name": "Pulguor",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.98675,
+   "longitude": 31.46417,
+   "issues": []
+  },
+  {
+   "name": "Pagaak",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.92935,
+   "longitude": 31.49575,
+   "issues": []
+  },
+  {
+   "name": "Pajimar",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 8.00105,
+   "longitude": 31.52654,
+   "issues": []
+  },
+  {
+   "name": "Patuet",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.84937,
+   "longitude": 31.69672,
+   "issues": []
+  },
+  {
+   "name": "Choltim",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.87978,
+   "longitude": 31.72174,
+   "issues": []
+  },
+  {
+   "name": "Tindiir",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.86276,
+   "longitude": 31.67986,
+   "issues": []
+  },
+  {
+   "name": "Tiam",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.78333,
+   "longitude": 31.77633,
+   "issues": []
+  },
+  {
+   "name": "Khoat",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.91145,
+   "longitude": 31.76982,
+   "issues": []
+  },
+  {
+   "name": "Koyoom",
+   "state": "Jonglei",
+   "county": "Duk",
+   "payam": null,
+   "latitude": 7.48599,
+   "longitude": 30.85115,
+   "issues": []
+  },
+  {
+   "name": "Kuernyang",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Barbuoi",
+   "latitude": 9.32275,
+   "longitude": 30.88692,
+   "issues": []
+  },
+  {
+   "name": "Dhornor",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Mareang",
+   "latitude": 8.553314,
+   "longitude": 30.4441,
+   "issues": []
+  },
+  {
+   "name": "Toch",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Mareang",
+   "latitude": 8.58248,
+   "longitude": 30.423003,
+   "issues": []
+  },
+  {
+   "name": "Paguir-SC",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Paguir",
+   "latitude": 9.063643,
+   "longitude": 30.454416,
+   "issues": []
+  },
+  {
+   "name": "Keew- SC",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Pulita",
+   "latitude": 9.154861,
+   "longitude": 30.38847,
+   "issues": []
+  },
+  {
+   "name": "Wicmuon",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Barboi",
+   "latitude": 9.35001,
+   "longitude": 31.56768,
+   "issues": [
+    "coordinates are 44 km outside Fangak, in Canal/Pigi county"
+   ]
+  },
+  {
+   "name": "Tiep",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Barbuoi",
+   "latitude": 9.40199,
+   "longitude": 30.90168,
+   "issues": []
+  },
+  {
+   "name": "Panyang",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Manajang",
+   "latitude": 9.191037,
+   "longitude": 30.40169,
+   "issues": []
+  },
+  {
+   "name": "Choatbora",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Old Fangak",
+   "latitude": 9.124131,
+   "longitude": 31.02768,
+   "issues": []
+  },
+  {
+   "name": "Juaibor",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Manajang",
+   "latitude": 9.326511,
+   "longitude": 30.868417,
+   "issues": []
+  },
+  {
+   "name": "Kamel",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Manajang",
+   "latitude": 9.255563,
+   "longitude": 30.873854,
+   "issues": []
+  },
+  {
+   "name": "Keew",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Pulita",
+   "latitude": 9.160688,
+   "longitude": 30.813783,
+   "issues": []
+  },
+  {
+   "name": "Nyadin",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Mareang",
+   "latitude": 9.226996,
+   "longitude": 30.681581,
+   "issues": []
+  },
+  {
+   "name": "Manajang",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Manajang",
+   "latitude": 9.231808,
+   "longitude": 31.030661,
+   "issues": []
+  },
+  {
+   "name": "Old Fangak",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Old Fangak",
+   "latitude": 9.047073,
+   "longitude": 30.865801,
+   "issues": []
+  },
+  {
+   "name": "Phom",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "New Fangak",
+   "latitude": 9.134063,
+   "longitude": 30.439845,
+   "issues": []
+  },
+  {
+   "name": "Pulita South",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Pulita",
+   "latitude": 9.134059,
+   "longitude": 30.394699,
+   "issues": []
+  },
+  {
+   "name": "Wanglel",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Old Fangak",
+   "latitude": 9.10681,
+   "longitude": 30.512144,
+   "issues": []
+  },
+  {
+   "name": "Koatnyakoang",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Barbuoi",
+   "latitude": 9.065995,
+   "longitude": 30.41163,
+   "issues": []
+  },
+  {
+   "name": "Kuerkan",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "New Fangak",
+   "latitude": 9.251771,
+   "longitude": 31.06179,
+   "issues": []
+  },
+  {
+   "name": "Pakan",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "New Fangak",
+   "latitude": 9.109741,
+   "longitude": 30.762085,
+   "issues": []
+  },
+  {
+   "name": "Lerpiny",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Pulita",
+   "latitude": 9.109741,
+   "longitude": 30.762085,
+   "issues": [
+    "same coordinates as Pakan"
+   ]
+  },
+  {
+   "name": "Dhoreak",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Paguir",
+   "latitude": 9.119236,
+   "longitude": 30.766673,
+   "issues": []
+  },
+  {
+   "name": "Pulkei",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Barbuoi",
+   "latitude": 9.120292,
+   "longitude": 30.752587,
+   "issues": []
+  },
+  {
+   "name": "Kuemduok",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Barbuoi",
+   "latitude": 9.42041,
+   "longitude": 31.265096,
+   "issues": []
+  },
+  {
+   "name": "Paguir",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Paguir",
+   "latitude": 7.977638,
+   "longitude": 31.985824,
+   "issues": [
+    "coordinates are 136 km outside Fangak, in Uror county"
+   ]
+  },
+  {
+   "name": "Nyimkuan",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Paguir",
+   "latitude": 9.119118,
+   "longitude": 30.765813,
+   "issues": []
+  },
+  {
+   "name": "Leel",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Paguir",
+   "latitude": 9.033934,
+   "longitude": 30.421914,
+   "issues": []
+  },
+  {
+   "name": "Tangnyang",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Manajang",
+   "latitude": 9.211858,
+   "longitude": 30.39818,
+   "issues": []
+  },
+  {
+   "name": "Dor",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "New Fangak",
+   "latitude": 9.23345,
+   "longitude": 31.102813,
+   "issues": []
+  },
+  {
+   "name": "Kuerdeng",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Mareang",
+   "latitude": null,
+   "longitude": null,
+   "issues": [
+    "no coordinates in the sheet"
+   ]
+  },
+  {
+   "name": "Tungkol",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Pulita",
+   "latitude": 9.114738,
+   "longitude": 30.412709,
+   "issues": []
+  },
+  {
+   "name": "Thokchak",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Paguir",
+   "latitude": 9.103598,
+   "longitude": 30.445352,
+   "issues": []
+  },
+  {
+   "name": "Hotkech",
+   "state": "Jonglei",
+   "county": "Fangak",
+   "payam": "Barboi",
+   "latitude": 9.2824,
+   "longitude": 30.562595,
+   "issues": []
+  },
+  {
+   "name": "Akon PHCC",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.887348,
+   "longitude": 27.95695,
+   "issues": []
+  },
+  {
+   "name": "Alek PHCC",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.66394,
+   "longitude": 28.14856,
+   "issues": []
+  },
+  {
+   "name": "Gogrial PHCC",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.52683,
+   "longitude": 28.10014,
+   "issues": []
+  },
+  {
+   "name": "Mayen Gumel",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.45276,
+   "longitude": 28.120064,
+   "issues": []
+  },
+  {
+   "name": "Ajiep PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.26555,
+   "longitude": 28.08942,
+   "issues": []
+  },
+  {
+   "name": "Atuk-Kuel PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.64406,
+   "longitude": 27.99594,
+   "issues": []
+  },
+  {
+   "name": "Keet PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.81848,
+   "longitude": 28.07093,
+   "issues": []
+  },
+  {
+   "name": "Magai PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.10439,
+   "longitude": 28.00818,
+   "issues": []
+  },
+  {
+   "name": "Maluil Ajak PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.52884,
+   "longitude": 27.97612,
+   "issues": []
+  },
+  {
+   "name": "Nyiel-kou",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.3459,
+   "longitude": 28.22,
+   "issues": []
+  },
+  {
+   "name": "Mayom",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.682773,
+   "longitude": 28.27306,
+   "issues": []
+  },
+  {
+   "name": "Panliet PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.84237,
+   "longitude": 28.25539,
+   "issues": []
+  },
+  {
+   "name": "Peeth PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.96718,
+   "longitude": 28.01134,
+   "issues": []
+  },
+  {
+   "name": "Thurnyior PHCU",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.14492,
+   "longitude": 28.13195,
+   "issues": []
+  },
+  {
+   "name": "Rumameth",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.501784,
+   "longitude": 28.103581,
+   "issues": []
+  },
+  {
+   "name": "Ngapathian",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.354275,
+   "longitude": 28.768,
+   "issues": [
+    "coordinates are 51 km outside Gogrial West, in Tonj North county"
+   ]
+  },
+  {
+   "name": "Man-kuac",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.413411,
+   "longitude": 28.1795,
+   "issues": []
+  },
+  {
+   "name": "Mangar",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.223778,
+   "longitude": 27.992258,
+   "issues": [
+    "corrected: 8.223778, 27.595355 read as degrees and minutes (8.22378, 27.99226), which is inside Gogrial West; please confirm"
+   ]
+  },
+  {
+   "name": "Mathiangdit",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.53576,
+   "longitude": 27.953213,
+   "issues": [
+    "corrected: 8.53576, 27.571928 read as degrees and minutes (8.53576, 27.95321), which is inside Gogrial West; please confirm"
+   ]
+  },
+  {
+   "name": "Man-Deng",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.3429,
+   "longitude": 27.96,
+   "issues": [
+    "corrected: 8.3429, 27.576 read as degrees and minutes (8.34290, 27.96000), which is inside Gogrial West; please confirm"
+   ]
+  },
+  {
+   "name": "Wun-kuel",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.394815,
+   "longitude": 28.855232,
+   "issues": [
+    "coordinates are 57 km outside Gogrial West, in Tonj North county"
+   ]
+  },
+  {
+   "name": "Mabior Atuot",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.1055,
+   "longitude": 27.953667,
+   "issues": [
+    "corrected: 8.0633, 27.5722 read as degrees and minutes (8.10550, 27.95367), which is inside Gogrial West; please confirm"
+   ]
+  },
+  {
+   "name": "Lukluk",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.19531,
+   "longitude": 27.98592,
+   "issues": []
+  },
+  {
+   "name": "Mayen-Pajok",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 9.01653,
+   "longitude": 27.92304,
+   "issues": []
+  },
+  {
+   "name": "Madol",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.573979,
+   "longitude": 27.955588,
+   "issues": [
+    "corrected: 8.573979, 27.573353 read as degrees and minutes (8.57398, 27.95559), which is inside Gogrial West; please confirm"
+   ]
+  },
+  {
+   "name": "Majak-Bol",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 9.14831,
+   "longitude": 27.9185,
+   "issues": []
+  },
+  {
+   "name": "Ariang",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.789226,
+   "longitude": 27.8092,
+   "issues": [
+    "coordinates are 18 km outside Gogrial West, in Aweil South county"
+   ]
+  },
+  {
+   "name": "Mabil",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.5849,
+   "longitude": 27.521761,
+   "issues": [
+    "coordinates are 43 km outside Gogrial West, in Aweil South county"
+   ]
+  },
+  {
+   "name": "Pajok Bek",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.341,
+   "longitude": 28.1331,
+   "issues": []
+  },
+  {
+   "name": "Kuajok SC",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.29658,
+   "longitude": 27.98236,
+   "issues": []
+  },
+  {
+   "name": "Alek SC",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": 8.66394,
+   "longitude": 28.14856,
+   "issues": [
+    "same coordinates as Alek PHCC"
+   ]
+  },
+  {
+   "name": "Agei",
+   "state": "Warrap",
+   "county": "Gogrial West",
+   "payam": null,
+   "latitude": null,
+   "longitude": null,
+   "issues": [
+    "no coordinates in the sheet"
+   ]
+  }
+ ]
+}
