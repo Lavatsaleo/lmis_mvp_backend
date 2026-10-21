@@ -26,6 +26,7 @@ const stockCountRoutes = require("./routes/stockCounts");
 const labelRoutes = require("./routes/labels");
 const dhis2Routes = require("./routes/dhis2");
 const dhis2ChildrenRoutes = require("./routes/dhis2Children");
+const dhis2SyncStatusRoutes = require("./routes/dhis2SyncStatus");
 const dhis2Sync = require("./dhis2/sync");
 
 // ✅ ADD THIS (new)
@@ -70,6 +71,7 @@ app.use("/api/stock-counts", stockCountRoutes);
 app.use("/api/labels", labelRoutes);
 app.use("/api/dhis2", dhis2Routes);
 app.use("/api/dhis2-children", dhis2ChildrenRoutes);
+app.use("/api/dhis2-sync", dhis2SyncStatusRoutes);
 
 // ✅ ADD THIS (new) — keep it BEFORE app.use("/api", userRoutes)
 app.use("/api/dashboard", dashboardRoutes);

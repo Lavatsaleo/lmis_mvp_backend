@@ -482,6 +482,47 @@ async function syncTrackerProgram(configId, { trigger = "SCHEDULE", fromStart = 
   }
 }
 
+/**
+ * Re-read one site's children of a program from DHIS2 (support "re-sync").
+ * Does not move the program's cursor, so the regular sync is unaffected.
+ */
+async function syncTrackerSite(configId, orgUnit, { trigger = "SUPPORT", siteName = null } = {}) {
+  const key = `tracker:${configId}`;
+  if (running.has(key)) return { skipped: "This program is already syncing" };
+  const config = await prisma.dhis2TrackerProgram.findUnique({ where: { id: configId } });
+  if (!config) throw new Error("Tracker program not found");
+  if (config.mapping?.version !== MAPPING_VERSION || !config.pullCursor) return { skipped: "The first full read of this program has not run yet" };
+  running.add(key);
+  const run = await prisma.dhis2SyncRun.create({ data: { implementationId: config.implementationId, direction: `TRACKER_SITE:${config.code}`, trigger } });
+  const stats = { mode: "site", orgUnit, site: siteName, children: 0, added: 0, updated: 0, visits: 0, beforeStart: 0, removed: 0 };
+  try {
+    const ouCache = new Map();
+    for (let page = 1; page <= 1000; page += 1) {
+      const r = await client.request("tracker/trackedEntities", {
+        query: {
+          program: config.programId,
+          orgUnits: orgUnit,
+          orgUnitMode: "SELECTED",
+          fields: TE_FIELDS,
+          pageSize: 100,
+          page,
+          ...(config.startDate ? { enrollmentEnrolledAfter: config.startDate.toISOString().slice(0, 10) } : {}),
+        },
+      });
+      const tes = listOf(r, "trackedEntities");
+      await saveBatch(config, tes, ouCache, stats);
+      if (tes.length < 100) break;
+    }
+    await prisma.dhis2SyncRun.update({ where: { id: run.id }, data: { status: "SUCCESS", stats, finishedAt: new Date() } });
+    return { ok: true, stats };
+  } catch (err) {
+    await prisma.dhis2SyncRun.update({ where: { id: run.id }, data: { status: "FAILED", stats, error: String(err.message || err).slice(0, 4000), finishedAt: new Date() } });
+    return { ok: false, error: err.message || String(err), stats };
+  } finally {
+    running.delete(key);
+  }
+}
+
 /** Scheduler hook: sync enabled programs whose interval has passed. */
 async function syncDueTrackerPrograms() {
   const programs = await prisma.dhis2TrackerProgram.findMany({ where: { enabled: true } });
@@ -498,4 +539,4 @@ async function syncDueTrackerPrograms() {
 
 const isTrackerRunning = (configId) => running.has(`tracker:${configId}`);
 
-module.exports = { detectMapping, optionName, commodityOf, givenAtVisit, totalsOf, syncTrackerProgram, syncDueTrackerPrograms, isTrackerRunning, summarise, visitFromEvent };
+module.exports = { detectMapping, optionName, commodityOf, givenAtVisit, totalsOf, syncTrackerProgram, syncTrackerSite, syncDueTrackerPrograms, isTrackerRunning, summarise, visitFromEvent };

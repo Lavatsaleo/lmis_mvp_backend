@@ -68,6 +68,7 @@ async function buildWhere(req) {
   const q = req.query;
   const and = [{ deleted: false }, scope];
   if (q.programId) and.push({ programConfigId: String(q.programId) });
+  if (q.county) and.push({ countyName: String(q.county) });
   if (q.orgUnit) and.push({ orgUnitUid: String(q.orgUnit) });
   if (q.status) and.push(statusWhere(q.status));
   const ef = dayStart(q.enrolledFrom);

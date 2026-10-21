@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const prisma = require("../lib/prisma");
+const { Prisma } = require("@prisma/client");
 const { requireAuth } = require("../middleware/auth");
 // Children, reports and duplicate cases are CLINICAL; stock views are open to all modules.
 const { requireModule } = require("../middleware/modules");
@@ -2216,6 +2217,153 @@ router.patch("/duplicate-cases/:id/resolve", requireAuth, requireModule("CLINICA
 
     const rows = await enrichDuplicateCases([updated]);
     return res.json({ message: "Duplicate case updated", case: rows[0] });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Server error", error: String(err.message || err) });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// GET /api/dashboard/programme-map?implementationId=&programIds=a,b&from=&to=
+// Programme map for countries tracking children in Anchor (Kenya): per facility,
+// admissions in the period, children in treatment now, missed appointments,
+// discharges by outcome in the period and sachets dispensed in the period, with
+// the facility's GPS position. Same shape as /api/dhis2-children/map.
+// -----------------------------------------------------------------------------
+// Exit outcomes of the discharge assessment, grouped like the DHIS2 programmes.
+const KENYA_OUTCOMES = [
+  ["cured", /achieved normal/i],
+  ["died", /died|death/i],
+  ["defaulted", /lost to follow|default/i],
+  ["nonResponse", /deteriorat|not achieved|non.?respon/i],
+];
+const exitGroup = (o) => {
+  const text = String(o || "");
+  if (/not achieved/i.test(text)) return "nonResponse";
+  return KENYA_OUTCOMES.find(([, re]) => re.test(text))?.[0] || "otherExits";
+};
+const PROGRAM_CODES = { SQLNS: "SQ-LNS" };
+
+router.get("/programme-map", requireAuth, requireModule("CLINICAL"), async (req, res) => {
+  try {
+    const scope = await getScope(req);
+    // Facilities in view. A Super Admin without a country sees the countries that track children in Anchor.
+    const facilityWhere = { type: "FACILITY" };
+    if (scope.mode === "ALL") {
+      facilityWhere.implementation = { modules: { some: { module: "CLINICAL", isEnabled: true } } };
+    } else {
+      facilityWhere.id = { in: scope.facilityIdsFacilitiesOnly };
+    }
+    const facilities = await prisma.facility.findMany({
+      where: facilityWhere,
+      select: { id: true, code: true, name: true, latitude: true, longitude: true },
+      orderBy: { name: "asc" },
+    });
+    const facilityIds = facilities.map((f) => f.id);
+
+    const parseDay = (v, end) => {
+      if (!v) return null;
+      const d = new Date(String(v));
+      if (Number.isNaN(d.getTime())) return null;
+      d.setHours(end ? 23 : 0, end ? 59 : 0, end ? 59 : 0, end ? 999 : 0);
+      return d;
+    };
+    const from = parseDay(req.query.from, false);
+    const to = parseDay(req.query.to, true);
+    const inPeriod = (d) => !!d && (!from || d >= from) && (!to || d <= to);
+
+    const allPrograms = facilityIds.length
+      ? (await prisma.child.findMany({ where: { facilityId: { in: facilityIds } }, select: { program: true }, distinct: ["program"] })).map((r) => r.program)
+      : [];
+    const programs = allPrograms.sort().map((p) => ({ id: p, code: PROGRAM_CODES[p] || p, name: PROGRAM_CODES[p] || p }));
+    const wanted = String(req.query.programIds || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    const programIds = wanted.length ? allPrograms.filter((p) => wanted.includes(p)) : allPrograms;
+
+    const children = facilityIds.length && programIds.length
+      ? await prisma.child.findMany({
+          where: { facilityId: { in: facilityIds }, program: { in: programIds } },
+          select: {
+            id: true,
+            facilityId: true,
+            program: true,
+            enrollmentDate: true,
+            inDepthAssessments: { where: { assessmentType: "DISCHARGE" }, select: { assessmentDate: true, data: true } },
+            visits: { orderBy: { visitDate: "desc" }, take: 1, select: { nextAppointmentDate: true } },
+          },
+        })
+      : [];
+
+    const today = startOfDay(new Date());
+    const sites = new Map();
+    const slot = (facilityId, program) => {
+      const site = sites.get(facilityId);
+      site.programs[program] = site.programs[program] || { admissions: 0, inTreatment: 0, missed: 0, cured: 0, died: 0, defaulted: 0, nonResponse: 0, otherExits: 0 };
+      return site.programs[program];
+    };
+    const byId = new Map(facilities.map((f) => [f.id, f]));
+    for (const c of children) {
+      if (!sites.has(c.facilityId)) {
+        const f = byId.get(c.facilityId);
+        sites.set(c.facilityId, {
+          key: f.id,
+          code: f.code,
+          name: f.name,
+          payam: null,
+          county: null,
+          state: null,
+          latitude: f.latitude === null ? null : Number(f.latitude),
+          longitude: f.longitude === null ? null : Number(f.longitude),
+          inAnchor: true,
+          programs: {},
+          given: [],
+        });
+      }
+      const x = slot(c.facilityId, c.program);
+      if (inPeriod(c.enrollmentDate)) x.admissions += 1;
+      const discharge = c.inDepthAssessments[0];
+      if (discharge) {
+        const exit = discharge.data?.exit || {};
+        const exitDate = exit.exitDate ? parseDay(exit.exitDate, false) : discharge.assessmentDate;
+        if (inPeriod(exitDate || discharge.assessmentDate)) x[exitGroup(exit.outcome)] += 1;
+      } else {
+        x.inTreatment += 1;
+        const next = c.visits[0]?.nextAppointmentDate;
+        if (next && startOfDay(next) < today) x.missed += 1;
+      }
+    }
+
+    // Sachets dispensed in the period, by the child's facility and program.
+    if (children.length) {
+      const given = await prisma.$queryRaw`
+        SELECT c.facilityId AS facilityId, c.program AS program, SUM(d.quantitySachets) AS amount
+        FROM \`Dispense\` d
+        JOIN \`ChildVisit\` v ON v.id = d.visitId
+        JOIN \`Child\` c ON c.id = v.childId
+        WHERE c.facilityId IN (${Prisma.join([...sites.keys()])})
+          AND c.program IN (${Prisma.join(programIds)})
+          ${from ? Prisma.sql`AND v.visitDate >= ${from}` : Prisma.empty}
+          ${to ? Prisma.sql`AND v.visitDate <= ${to}` : Prisma.empty}
+        GROUP BY c.facilityId, c.program`;
+      for (const r of given) {
+        const site = sites.get(r.facilityId);
+        if (site && Number(r.amount)) site.given.push({ programConfigId: r.program, commodity: PROGRAM_CODES[r.program] || r.program, unit: "sachets", amount: Number(r.amount) });
+      }
+    }
+
+    const idleSites = facilities
+      .filter((f) => !sites.has(f.id))
+      .map((f) => ({ name: f.name, code: f.code, latitude: f.latitude === null ? null : Number(f.latitude), longitude: f.longitude === null ? null : Number(f.longitude) }));
+
+    return res.json({
+      period: { from: req.query.from || null, to: req.query.to || null },
+      programs: programs.map((p) => ({ ...p, selected: programIds.includes(p.id) })),
+      sites: [...sites.values()],
+      idleSites,
+      gpsIssues: [],
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Server error", error: String(err.message || err) });
