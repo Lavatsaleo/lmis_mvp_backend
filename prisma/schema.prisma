@@ -816,6 +816,8 @@ model Dhis2Child {
   lastVisitDate     DateTime?
   nextVisitDate     DateTime?
   sachetsTotal      Int       @default(0)
+  // Given in total, per commodity and unit: [{ commodity, unit, amount }].
+  commodityTotals   Json?
   lastWeightKg      Float?
   lastMuacCm        Float?
   lastWhz           Float?
@@ -824,8 +826,9 @@ model Dhis2Child {
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
-  programConfig Dhis2TrackerProgram @relation(fields: [programConfigId], references: [id], onDelete: Cascade)
+  programConfig Dhis2TrackerProgram   @relation(fields: [programConfigId], references: [id], onDelete: Cascade)
   visits        Dhis2ChildVisit[]
+  commodityRows Dhis2VisitCommodity[]
 
   @@index([implementationId, programConfigId])
   @@index([orgUnitUid])
@@ -850,6 +853,10 @@ model Dhis2ChildVisit {
   whz             Float?
   oedema          String?
   sachets         Int?
+  // "Treatment given" answer (e.g. RUSF) and what was given at the visit:
+  // [{ commodity, unit, amount }] (units differ: sachets, kg).
+  treatment       String?
+  commodities     Json?
   nutritionStatus String?
   visitStatus     String?
   nextVisitDate   DateTime?
@@ -858,9 +865,31 @@ model Dhis2ChildVisit {
   deleted         Boolean   @default(false)
   dhis2UpdatedAt  DateTime?
 
-  child Dhis2Child @relation(fields: [childId], references: [id], onDelete: Cascade)
+  child         Dhis2Child            @relation(fields: [childId], references: [id], onDelete: Cascade)
+  commodityRows Dhis2VisitCommodity[]
 
   @@index([childId])
+  @@index([occurredAt])
+}
+
+// One commodity given at one counted visit (for totals per commodity and unit;
+// a visit gives one commodity, chosen by "Treatment given" where asked).
+model Dhis2VisitCommodity {
+  id              String    @id @default(cuid())
+  visitId         String
+  childId         String
+  programConfigId String
+  commodity       String
+  unit            String
+  amount          Float
+  occurredAt      DateTime?
+
+  visit Dhis2ChildVisit @relation(fields: [visitId], references: [id], onDelete: Cascade)
+  child Dhis2Child      @relation(fields: [childId], references: [id], onDelete: Cascade)
+
+  @@index([visitId])
+  @@index([childId])
+  @@index([programConfigId, commodity])
   @@index([occurredAt])
 }
 

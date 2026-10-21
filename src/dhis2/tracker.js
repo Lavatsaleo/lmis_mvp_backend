@@ -45,7 +45,25 @@ const DATA_ELEMENT_ROLES = {
   nutritionStatus: (n) => /nutrition(al)? status/i.test(n),
   outcome: (n) => /discharge outcome|exit outcome|^outcome$/i.test(n),
   admissionType: (n) => /type of admission|admission type/i.test(n),
+  treatment: (n) => /treatment given|commodity given|type of (ration|treatment)/i.test(n),
 };
+
+// Mapping format; an older stored mapping is re-detected on the next sync.
+const MAPPING_VERSION = 2;
+
+/** Commodity named in a field or answer: RUTF, RUSF, CSB++, SQ-LNS. */
+function commodityOf(text) {
+  const t = String(text || "");
+  if (/rutf/i.test(t)) return "RUTF";
+  if (/rusf/i.test(t)) return "RUSF";
+  if (/csb/i.test(t)) return "CSB++";
+  if (/sq-?lns|\blns\b/i.test(t)) return "SQ-LNS";
+  return null;
+}
+const unitOf = (name) => (/\bkg\b|kilo/i.test(name) ? "kg" : "sachets");
+// A field holding an amount given (not the recommended ration).
+const isGivenAmount = (name) =>
+  /(provided|given|dispensed|distributed)/i.test(name) && !/recommend/i.test(name) && (/sachets?|\bkg\b|kilo|carton/i.test(name) || !!commodityOf(name));
 
 /** Read a tracker program's metadata and work out the mapping. */
 async function detectMapping(programId) {
@@ -74,12 +92,17 @@ async function detectMapping(programId) {
   const stageLabels = {};
   const dataElements = {};
   const deLabels = {};
+  const quantities = [];
   for (const st of (p.programStages || []).sort((x, y) => (x.sortOrder || 0) - (y.sortOrder || 0))) {
     stageLabels[st.id] = st.displayName;
     for (const [role, test] of Object.entries(STAGE_ROLES)) if (!stages[role] && test(st.displayName)) stages[role] = st.id;
     for (const { dataElement: d } of st.programStageDataElements || []) {
       deLabels[d.id] = d.displayName;
       keepOptions(d.id, d.optionSet);
+      // Amount of a commodity given at a visit, with its unit.
+      if (["NUMBER", "INTEGER", "INTEGER_POSITIVE", "INTEGER_ZERO_OR_POSITIVE", "TEXT"].includes(d.valueType) && isGivenAmount(d.displayName)) {
+        if (!quantities.some((q) => q.id === d.id)) quantities.push({ id: d.id, commodity: commodityOf(d.displayName), unit: unitOf(d.displayName) });
+      }
       for (const [role, test] of Object.entries(DATA_ELEMENT_ROLES)) {
         if (test(d.displayName)) {
           dataElements[role] = dataElements[role] || [];
@@ -90,7 +113,7 @@ async function detectMapping(programId) {
   }
   return {
     program: { id: p.id, name: p.displayName },
-    mapping: { attributes, stages, dataElements },
+    mapping: { version: MAPPING_VERSION, attributes, stages, dataElements, quantities },
     labels: { attributes: attrLabels, stages: stageLabels, dataElements: deLabels, options },
   };
 }
@@ -139,7 +162,30 @@ function stageOf(mapping, programStage) {
   return "OTHER";
 }
 
-function visitFromEvent(mapping, e, labels) {
+/**
+ * What was given at a visit: one entry per commodity, with its unit. Where the
+ * form asks "Treatment given", only that commodity's amount counts (values
+ * left in the other commodities' fields are ignored).
+ */
+function givenAtVisit(mapping, values, labels, treatment, defaultCommodity) {
+  const items = [];
+  for (const q of mapping.quantities || []) {
+    const raw = values.get(q.id);
+    const amount = num(optionName(labels, q.id, raw) ?? raw);
+    if (amount === null || amount <= 0) continue;
+    const commodity = q.commodity || defaultCommodity || "Sachets";
+    if (items.some((i) => i.commodity === commodity && i.unit === q.unit)) continue;
+    items.push({ commodity, unit: q.unit, amount });
+  }
+  const chosen = commodityOf(treatment);
+  if (chosen) {
+    const match = items.filter((i) => commodityOf(i.commodity) === chosen);
+    if (match.length) return match;
+  }
+  return items;
+}
+
+function visitFromEvent(mapping, e, labels, defaultCommodity) {
   const de = mapping.dataElements || {};
   const values = new Map((e.dataValues || []).map((d) => [d.dataElement, d.value]));
   const named = (ids) => {
@@ -149,7 +195,11 @@ function visitFromEvent(mapping, e, labels) {
     }
     return null;
   };
-  const sachets = num(firstValue(values, de.sachets));
+  const treatment = named(de.treatment);
+  const given = mapping.quantities ? givenAtVisit(mapping, values, labels, treatment, defaultCommodity) : null;
+  const sachets = given
+    ? given.filter((g) => g.unit === "sachets").reduce((n, g) => n + g.amount, 0) || null
+    : num(firstValue(values, de.sachets));
   return {
     eventUid: e.event,
     stage: stageOf(mapping, e.programStage),
@@ -163,6 +213,8 @@ function visitFromEvent(mapping, e, labels) {
     whz: num(firstValue(values, de.whz)),
     oedema: named(de.oedema),
     sachets: sachets === null ? null : Math.round(sachets),
+    treatment,
+    commodities: given && given.length ? given : null,
     nutritionStatus: named(de.nutritionStatus),
     visitStatus: named(de.visitStatus),
     nextVisitDate: dateOnly(firstValue(values, de.nextVisit)),
@@ -210,12 +262,25 @@ function summarise(mapping, enrollment, visits, dob, ageAttr, labels) {
     lastVisitDate: last?.occurredAt || null,
     nextVisitDate,
     sachetsTotal: treatment.reduce((n, v) => n + (v.sachets || 0), 0),
+    commodityTotals: totalsOf(treatment),
     lastWeightKg: latestWith("weightKg"),
     lastMuacCm: latestWith("muacCm"),
     lastWhz: latestWith("whz"),
     ageMonths,
   };
 }
+/** Given in total, per commodity and unit, over counted visits. */
+function totalsOf(visits) {
+  const map = new Map();
+  for (const v of visits) {
+    for (const g of v.commodities || []) {
+      const key = `${g.commodity}|${g.unit}`;
+      map.set(key, { commodity: g.commodity, unit: g.unit, amount: (map.get(key)?.amount || 0) + g.amount });
+    }
+  }
+  return [...map.values()].map((x) => ({ ...x, amount: Math.round(x.amount * 100) / 100 })).sort((a, b) => a.commodity.localeCompare(b.commodity));
+}
+
 function visitFromEventValue(visit, mapping, role, labels) {
   const ids = mapping.dataElements?.[role] || [];
   for (const id of ids) if (visit.dataValues?.[id]) return optionName(labels, id, visit.dataValues[id]);
@@ -270,7 +335,7 @@ async function saveTrackedEntity(config, te, ouCache, siteByOu, stats) {
       stats.beforeStart += 1;
       continue;
     }
-    const visits = (en.events || []).map((e) => visitFromEvent(mapping, e, labels));
+    const visits = (en.events || []).map((e) => visitFromEvent(mapping, e, labels, config.commodity));
     const sum = summarise(mapping, en, visits, dob, ageAttr, labels);
     const ou = ouCache.get(en.orgUnit) || { name: en.orgUnit };
     const data = {
@@ -290,7 +355,14 @@ async function saveTrackedEntity(config, te, ouCache, siteByOu, stats) {
     await prisma.$transaction(async (tx) => {
       const child = await tx.dhis2Child.upsert({ where: { enrollmentUid: en.enrollment }, create: { enrollmentUid: en.enrollment, ...data }, update: data });
       for (const v of visits) {
-        await tx.dhis2ChildVisit.upsert({ where: { eventUid: v.eventUid }, create: { ...v, childId: child.id }, update: { ...v, childId: child.id } });
+        const saved = await tx.dhis2ChildVisit.upsert({ where: { eventUid: v.eventUid }, create: { ...v, childId: child.id }, update: { ...v, childId: child.id } });
+        await tx.dhis2VisitCommodity.deleteMany({ where: { visitId: saved.id } });
+        const counted = !v.deleted && !data.deleted && v.stage !== "DISCHARGE" && COUNTED.has(String(v.status || "").toUpperCase()) && v.occurredAt;
+        if (counted && v.commodities?.length) {
+          await tx.dhis2VisitCommodity.createMany({
+            data: v.commodities.map((g) => ({ visitId: saved.id, childId: child.id, programConfigId: config.id, commodity: g.commodity, unit: g.unit, amount: g.amount, occurredAt: v.occurredAt })),
+          });
+        }
       }
     });
     stats[existing ? "updated" : "added"] += 1;
@@ -347,10 +419,20 @@ async function syncTrackerProgram(configId, { trigger = "SCHEDULE", fromStart = 
   const key = `tracker:${configId}`;
   if (running.has(key)) return { skipped: "This program is already syncing" };
   running.add(key);
-  const config = await prisma.dhis2TrackerProgram.findUnique({ where: { id: configId } });
+  let config = await prisma.dhis2TrackerProgram.findUnique({ where: { id: configId } });
   if (!config) {
     running.delete(key);
     throw new Error("Tracker program not found");
+  }
+  if (config.mapping?.version !== MAPPING_VERSION) {
+    // New things to read (e.g. commodities per visit): refresh the mapping and read everything again.
+    try {
+      const detected = await detectMapping(config.programId);
+      config = await prisma.dhis2TrackerProgram.update({ where: { id: config.id }, data: { mapping: detected.mapping, labels: detected.labels, pullCursor: null } });
+    } catch (err) {
+      running.delete(key);
+      throw err;
+    }
   }
   const run = await prisma.dhis2SyncRun.create({ data: { implementationId: config.implementationId, direction: `TRACKER:${config.code}`, trigger } });
   const stats = { mode: "", children: 0, added: 0, updated: 0, visits: 0, beforeStart: 0, removed: 0 };
@@ -416,4 +498,4 @@ async function syncDueTrackerPrograms() {
 
 const isTrackerRunning = (configId) => running.has(`tracker:${configId}`);
 
-module.exports = { detectMapping, optionName, syncTrackerProgram, syncDueTrackerPrograms, isTrackerRunning, summarise, visitFromEvent };
+module.exports = { detectMapping, optionName, commodityOf, givenAtVisit, totalsOf, syncTrackerProgram, syncDueTrackerPrograms, isTrackerRunning, summarise, visitFromEvent };

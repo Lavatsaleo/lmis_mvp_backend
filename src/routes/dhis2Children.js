@@ -106,12 +106,16 @@ const childSelect = {
   lastVisitDate: true,
   nextVisitDate: true,
   sachetsTotal: true,
+  commodityTotals: true,
   lastWeightKg: true,
   lastMuacCm: true,
   lastWhz: true,
   enrollmentUid: true,
   trackedEntityUid: true,
 };
+
+/** "RUTF 130 sachets · CSB++ 4.5 kg" */
+const givenText = (items) => (items || []).map((g) => `${g.commodity} ${Number(g.amount).toLocaleString("en")} ${g.unit}`).join(" · ");
 
 /** Plain status of one child for the list. */
 function statusOf(c) {
@@ -186,6 +190,14 @@ router.get("/", async (req, res) => {
       prisma.dhis2Child.count({ where: { AND: [where, { outcome: null, enrollmentStatus: "ACTIVE", nextVisitDate: { lt: today } }] } }),
       prisma.dhis2Child.groupBy({ by: ["outcome"], where: { AND: [where, { outcome: { not: null } }] }, _count: { _all: true } }),
     ]);
+    const vf = dayStart(req.query.visitFrom);
+    const vt = dayEnd(req.query.visitTo);
+    const givenRows = await prisma.dhis2VisitCommodity.groupBy({
+      by: ["commodity", "unit"],
+      where: { child: where, ...(vf || vt ? { occurredAt: { ...(vf ? { gte: vf } : {}), ...(vt ? { lte: vt } : {}) } } : {}) },
+      _sum: { amount: true },
+      _count: { _all: true },
+    });
     return res.json({
       total,
       page,
@@ -199,6 +211,10 @@ router.get("/", async (req, res) => {
         outcomes: outcomes.map((o) => ({ outcome: o.outcome, children: o._count._all })).sort((a, b) => b.children - a.children),
         sachets: sachets._sum.sachetsTotal || 0,
         visits: sachets._sum.visitCount || 0,
+        // Given, per commodity and unit (units are never added together).
+        given: givenRows
+          .map((g) => ({ commodity: g.commodity, unit: g.unit, amount: Math.round((g._sum.amount || 0) * 100) / 100, visits: g._count._all }))
+          .sort((a, b) => a.commodity.localeCompare(b.commodity)),
       },
     });
   } catch (err) {
@@ -225,21 +241,21 @@ router.get("/export.csv", async (req, res) => {
     });
     const lines = [];
     if (visitsLevel) {
-      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Child name", "Sex", "Caregiver", "Visit type", "Status", "Date", "Scheduled", "Weight (kg)", "Height (cm)", "MUAC (cm)", "WHZ", "Oedema", "Sachets", "Nutrition status", "Visit status", "Next visit", "Outcome"].join(","));
+      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Child name", "Sex", "Caregiver", "Visit type", "Status", "Date", "Scheduled", "Weight (kg)", "Height (cm)", "MUAC (cm)", "WHZ", "Oedema", "Treatment given", "Commodity", "Amount", "Unit", "Nutrition status", "Visit status", "Next visit", "Outcome"].join(","));
       for (const c of children) {
         for (const v of c.visits) {
           lines.push(
-            [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.childName, c.sex, c.caregiverName, v.stage, v.status, v.occurredAt, v.scheduledAt, v.weightKg, v.heightCm, v.muacCm, v.whz, v.oedema, v.sachets, v.nutritionStatus, v.visitStatus, v.nextVisitDate, v.outcome]
+            [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.childName, c.sex, c.caregiverName, v.stage, v.status, v.occurredAt, v.scheduledAt, v.weightKg, v.heightCm, v.muacCm, v.whz, v.oedema, v.treatment, (v.commodities || [])[0]?.commodity, (v.commodities || [])[0]?.amount, (v.commodities || [])[0]?.unit, v.nutritionStatus, v.visitStatus, v.nextVisitDate, v.outcome]
               .map(csvCell)
               .join(",")
           );
         }
       }
     } else {
-      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Child name", "Sex", "Date of birth", "Age at admission (months)", "Caregiver", "Payam (address)", "Village/Boma", "Admitted", "Admission type", "Visits", "Last visit", "Next visit", "Status", "Outcome date", "Sachets given", "Last weight (kg)", "Last MUAC (cm)", "Last WHZ"].join(","));
+      lines.push(["Program", "Site", "Payam", "County", "Patient ID", "Child name", "Sex", "Date of birth", "Age at admission (months)", "Caregiver", "Payam (address)", "Village/Boma", "Admitted", "Admission type", "Visits", "Last visit", "Next visit", "Status", "Outcome date", "Given in total", "Last weight (kg)", "Last MUAC (cm)", "Last WHZ"].join(","));
       for (const c of children) {
         lines.push(
-          [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.childName, c.sex, c.dateOfBirth, c.ageMonths, c.caregiverName, c.addressPayam, c.addressVillage, c.enrolledAt, c.admissionType, c.visitCount, c.lastVisitDate, c.nextVisitDate, statusOf(c), c.outcomeDate, c.sachetsTotal, c.lastWeightKg, c.lastMuacCm, c.lastWhz]
+          [c.programConfig.code, c.orgUnitName, c.orgUnitParentName, c.countyName, c.patientId, c.childName, c.sex, c.dateOfBirth, c.ageMonths, c.caregiverName, c.addressPayam, c.addressVillage, c.enrolledAt, c.admissionType, c.visitCount, c.lastVisitDate, c.nextVisitDate, statusOf(c), c.outcomeDate, givenText(c.commodityTotals), c.lastWeightKg, c.lastMuacCm, c.lastWhz]
             .map(csvCell)
             .join(",")
         );
