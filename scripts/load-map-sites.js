@@ -10,14 +10,23 @@ require("dotenv").config({ quiet: true });
 const path = require("path");
 const { prisma } = require("../src/db");
 
-const IMPL = "impl_south_sudan_logistics";
+// The country's implementation is found by its country code ("SS"), so the
+// script works whatever id the implementation has on this server.
+const COUNTRY = "SS";
 const APPLY = process.argv.includes("--apply");
 
 (async () => {
   try {
     const file = require(path.join(__dirname, "data", "south-sudan-sites.json"));
-    const impl = await prisma.implementation.findUnique({ where: { id: IMPL } });
-    if (!impl) throw new Error("South Sudan implementation not found");
+    // The map reads the sites of the implementation that holds the DHIS2 programs.
+    const impls = await prisma.implementation.findMany({
+      where: { country: { code: COUNTRY } },
+      select: { id: true, name: true, _count: { select: { dhis2TrackerPrograms: true, mapSites: true } } },
+    });
+    const impl = impls.find((i) => i._count.dhis2TrackerPrograms > 0) || (impls.length === 1 ? impls[0] : null);
+    if (!impl) throw new Error(`No implementation found for country ${COUNTRY}${impls.length ? ` (several, none with DHIS2 programs: ${impls.map((i) => i.id).join(", ")})` : ""}`);
+    const IMPL = impl.id;
+    console.log(`Implementation: ${impl.name} (${impl.id}), ${impl._count.dhis2TrackerPrograms} DHIS2 program(s), ${impl._count.mapSites} site location(s) loaded so far.`);
     const existing = new Map((await prisma.mapSite.findMany({ where: { implementationId: IMPL } })).map((s) => [s.name, s]));
     let added = 0;
     let updated = 0;

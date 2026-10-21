@@ -10,15 +10,21 @@ require("dotenv").config({ quiet: true });
 const path = require("path");
 const { prisma } = require("../src/db");
 
-const IMPL = "impl_kenya_sqlns";
+// The country's implementation is found by its country code ("KE"), so the
+// script works whatever id the implementation has on this server.
+const COUNTRY = "KE";
 const APPLY = process.argv.includes("--apply");
 const FORCE = process.argv.includes("--force");
 
 (async () => {
   try {
     const file = require(path.join(__dirname, "data", "kenya-facility-locations.json"));
+    const impls = await prisma.implementation.findMany({ where: { country: { code: COUNTRY } }, select: { id: true, name: true } });
+    if (!impls.length) throw new Error(`No implementation found for country ${COUNTRY}`);
+    const ids = impls.map((i) => i.id);
+    console.log(`Implementation(s): ${impls.map((i) => `${i.name} (${i.id})`).join(", ")}`);
     const facilities = await prisma.facility.findMany({
-      where: { implementationId: IMPL, code: { in: file.facilities.map((f) => f.code) } },
+      where: { implementationId: { in: ids }, code: { in: file.facilities.map((f) => f.code) } },
       select: { id: true, code: true, name: true, latitude: true, longitude: true },
     });
     const byCode = new Map(facilities.map((f) => [f.code, f]));
