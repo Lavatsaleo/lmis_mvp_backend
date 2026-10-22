@@ -146,12 +146,14 @@ async function countOtherActiveSuperAdmins(userId) {
   return prisma.user.count({ where: { role: "SUPER_ADMIN", isActive: true, id: { not: userId } } });
 }
 
-// What a COUNTRY_ADMIN may not do: touch admin accounts, grant admin roles, or
-// reach outside their own country. Returns an error message or null.
+// What a COUNTRY_ADMIN may not do: change existing admin accounts, grant the
+// Super Admin role, or reach outside their own country. They may make another
+// Country Admin for their own country (the country is forced to theirs).
+// Returns an error message or null.
 function countryAdminLimit(req, { targetRole = null, grantRole = null, implementationId = undefined }) {
   if (!isCountryAdmin(req.user)) return null;
   if (targetRole && ADMIN_ROLES.has(targetRole)) return "Only a Super Admin can manage admin accounts.";
-  if (grantRole && ADMIN_ROLES.has(grantRole)) return "Only a Super Admin can grant admin roles.";
+  if (grantRole === "SUPER_ADMIN") return "Only a Super Admin can grant the Super Admin role.";
   if (implementationId !== undefined && !canAdministerImplementation(req.user, implementationId)) {
     return "You can only manage users in your own country.";
   }
